@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from PIL import Image
@@ -47,6 +47,7 @@ class SamplingResult:
     best_image: Image.Image
     best_attempt: int
     attempts: List[AttemptRecord]
+    images: List[Image.Image] = field(default_factory=list)
 
 
 class AdaptiveSampler:
@@ -81,6 +82,7 @@ class AdaptiveSampler:
         best_score: float = -1.0
         best_idx: int = 0
         records: List[AttemptRecord] = []
+        all_images: List[Image.Image] = []
 
         current_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         current_steps = steps
@@ -123,6 +125,7 @@ class AdaptiveSampler:
                 generation_time=gen_time,
             )
             records.append(record)
+            all_images.append(image)
 
             if score > best_score:
                 best_score = score
@@ -146,4 +149,5 @@ class AdaptiveSampler:
             best_image=best_image,
             best_attempt=best_idx,
             attempts=records,
+            images=all_images,
         )

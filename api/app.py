@@ -75,9 +75,9 @@ def create_app(
         )
 
         # Persist images and update records
-        for rec in result.attempts:
+        for i, rec in enumerate(result.attempts):
             artifact_id = store.save_image(
-                result.best_image if rec.attempt_number == result.best_attempt else result.best_image,
+                result.images[i],
                 job.job_id,
                 rec.attempt_number,
             )

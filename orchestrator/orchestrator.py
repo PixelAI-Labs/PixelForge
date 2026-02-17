@@ -24,9 +24,15 @@ class Orchestrator:
     """Manage FIFO job queue with single-GPU mutual exclusion."""
 
     def __init__(self) -> None:
-        self._gpu_lock = asyncio.Lock()
+        self._gpu_lock: Optional[asyncio.Lock] = None
         self._jobs: OrderedDict[str, Job] = OrderedDict()
         self._cancelled: set[str] = set()
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazily create the asyncio lock inside a running event loop."""
+        if self._gpu_lock is None:
+            self._gpu_lock = asyncio.Lock()
+        return self._gpu_lock
 
     # ---- job management -----------------------------------------
 
@@ -71,7 +77,7 @@ class Orchestrator:
             job.mark_cancelled()
             return
 
-        async with self._gpu_lock:
+        async with self._get_lock():
             job.mark_running()
             logger.info("Job %s running.", job.job_id)
             try:
