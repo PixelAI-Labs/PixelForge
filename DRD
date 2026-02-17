@@ -1,0 +1,230 @@
+# 📘 Design Requirements Document (DRD)
+## Project: PixelForge
+
+---
+
+# 1. System Overview
+
+PixelForge is a fully offline adaptive image generation system built on Stable Diffusion 1.5.
+
+The system improves output quality through a feedback-driven inference loop rather than model fine-tuning.
+
+Workflow:
+
+Prompt
+→ Generate Image
+→ Evaluate Quality
+→ Adjust Sampling Parameters
+→ Regenerate (if needed)
+→ Select Best Output
+
+---
+
+# 2. High-Level Architecture
+
+Frontend (Next.js)
+│
+▼
+FastAPI Backend
+│
+▼
+Job Orchestrator (FIFO + GPU Lock)
+│
+▼
+Generation Engine
+├── ModelManager
+├── QualityEvaluator
+└── AdaptiveSampler
+│
+▼
+Artifact Store (MongoDB / InMemory)
+
+---
+
+# 3. Architectural Principles
+
+- Fully offline
+- No ML imports in domain layer
+- Single GPU mutual exclusion
+- Deterministic metadata logging
+- Configurable adaptive sampling
+
+---
+
+# 4. Component Design
+
+---
+
+## 4.1 ModelManager
+
+### Responsibilities:
+- Load Stable Diffusion 1.5 pipeline
+- Manage device placement
+- Expose clean `generate()` interface
+- Accept configurable sampling parameters
+
+### Constraints:
+- Use `dtype=torch.float16`
+- Load model once at startup
+- No model reinitialization during jobs
+
+---
+
+## 4.2 QualityEvaluator
+
+### Responsibilities:
+Score generated images using measurable signals.
+
+### Metrics:
+
+#### CLIP Alignment
+- Encode prompt
+- Encode image
+- Compute cosine similarity
+
+#### Face Detection
+- Use Mediapipe or similar
+- Detect face presence and confidence
+
+#### Sharpness Metric
+- Laplacian variance via OpenCV
+
+### Quality Score:
+
+quality_score =
+w1 * clip_alignment +
+w2 * face_score +
+w3 * sharpness_score
+
+
+Normalized to 0–1.
+
+---
+
+## 4.3 AdaptiveSampler
+
+### Responsibilities:
+Adjust sampling parameters intelligently.
+
+### Algorithm:
+
+1. Generate initial image.
+2. Evaluate quality.
+3. If quality ≥ threshold → accept.
+4. Else:
+   - Increase steps (+10, max bound)
+   - Slightly modify CFG (±10%)
+   - Change seed
+   - Strengthen negative prompt
+   - Regenerate
+5. Repeat (max 3 attempts).
+6. Return best result.
+
+### Constraints:
+- Maximum 3 attempts
+- Small parameter deltas only
+- Log every attempt
+
+---
+
+## 4.4 Job Orchestrator
+
+### Responsibilities:
+- FIFO queue
+- GPU mutual exclusion
+- Track job lifecycle:
+  - Pending
+  - Running
+  - Completed
+  - Failed
+  - Cancelled
+
+---
+
+## 4.5 Artifact Store
+
+### Responsibilities:
+- Store images
+- Store attempt metadata
+- Provide retrieval endpoints
+
+Implementations:
+- MongoDB-backed store
+- InMemory fallback
+
+---
+
+## 4.6 API Layer
+
+### Responsibilities:
+- Accept generation requests
+- Return job status
+- Serve images
+- Serve quality metrics
+- Manage authentication
+
+---
+
+## 4.7 Frontend
+
+### Responsibilities:
+- Prompt submission UI
+- Show generation progress
+- Display attempt scores
+- Display final selected image
+- Gallery view
+
+---
+
+# 5. Data Flow
+
+1. User submits prompt.
+2. Job queued.
+3. Orchestrator assigns GPU.
+4. Initial image generated.
+5. QualityEvaluator scores output.
+6. AdaptiveSampler modifies parameters if needed.
+7. Best result stored.
+8. Response returned to frontend.
+
+---
+
+# 6. Performance Constraints
+
+- GPU-first inference
+- Max 3 attempts
+- No model reload during loop
+- Quality scoring under 200ms
+
+---
+
+# 7. Observability
+
+Log per attempt:
+
+- Seed
+- Steps
+- CFG
+- Resolution
+- Quality score
+- Execution time
+
+Enable structured logging.
+
+---
+
+# 8. Future Extensions
+
+- Learned distortion classifier
+- Reinforcement-style sampling optimization
+- Multi-GPU distributed workers
+- Adaptive CFG prediction model
+- User preference modeling
+
+---
+
+# 9. Design Philosophy
+
+PixelForge improves inference policy, not model weights.
+
+It treats diffusion as a stochastic search process and uses feedback to explore higher-quality regions of latent space.
