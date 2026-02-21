@@ -2,15 +2,16 @@
 # Backend
 fastapi>=0.100.0
 uvicorn>=0.23.0
-pydantic>=2.0.0
+pydantic[email]>=2.0.0
 PyJWT>=2.8.0
 bcrypt>=4.0.0
 
-# ML
-torch>=2.0.0
+# ML  (torch is installed separately with CUDA in the Dockerfile)
+# torch>=2.6.0
 diffusers>=0.25.0
 transformers>=4.30.0
 accelerate>=0.20.0
+safetensors>=0.4.0
 
 # Image processing
 opencv-python-headless>=4.8.0

@@ -5,8 +5,8 @@ Algorithm (from DESIGN.md / DRD):
 2. Evaluate quality
 3. If quality >= threshold → accept
 4. Else:
-   - Increase steps (+10, bounded)
-   - Adjust CFG ±10%
+   - Increase steps (+10, bounded to 100)
+   - Multiply CFG by 1.1 (bounded to 20.0)
    - Change seed
    - Strengthen negative prompt
    - Regenerate
@@ -16,7 +16,9 @@ Algorithm (from DESIGN.md / DRD):
 Constraints:
 * Max 3 attempts
 * Small parameter deltas
-* Log every attempt
+* Log every attempt with full debug info
+* Clear GPU memory after each attempt (CUDA)
+* No direct diffusers interaction — only via ModelManager.generate()
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_QUALITY_THRESHOLD = 0.65
 _MAX_ATTEMPTS = 3
+_MAX_STEPS = 100
+_MAX_CFG = 20.0
 _DEFAULT_NEGATIVE = "blurry, distorted, low quality, artifacts"
 
 
@@ -47,11 +51,25 @@ class SamplingResult:
     best_image: Image.Image
     best_attempt: int
     attempts: List[AttemptRecord]
-    images: List[Image.Image] = field(default_factory=list)
+    images: List[Optional[Image.Image]] = field(default_factory=list)
+
+
+def _clear_cuda_cache() -> None:
+    """Release cached GPU memory if CUDA is available."""
+    try:
+        import torch as _torch
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
+    except ImportError:
+        pass
 
 
 class AdaptiveSampler:
-    """Run the adaptive inference loop over ModelManager + QualityEvaluator."""
+    """Run the adaptive inference loop over ModelManager + QualityEvaluator.
+
+    This class never imports or interacts with ``diffusers`` directly.
+    All generation work is delegated to :class:`ModelManager`.
+    """
 
     def __init__(
         self,
@@ -91,7 +109,7 @@ class AdaptiveSampler:
 
         for attempt in range(1, self._max_attempts + 1):
             logger.info(
-                "Attempt %d/%d — seed=%d steps=%d cfg=%.2f",
+                "--- Attempt %d/%d ---  seed=%d  steps=%d  cfg=%.2f",
                 attempt,
                 self._max_attempts,
                 current_seed,
@@ -100,19 +118,61 @@ class AdaptiveSampler:
             )
 
             t0 = time.time()
-            image = self._mm.generate(
-                prompt=prompt,
-                steps=current_steps,
-                guidance_scale=current_cfg,
-                seed=current_seed,
-                width=width,
-                height=height,
-                negative_prompt=current_neg,
-            )
+            try:
+                image = self._mm.generate(
+                    prompt=prompt,
+                    steps=current_steps,
+                    guidance_scale=current_cfg,
+                    seed=current_seed,
+                    width=width,
+                    height=height,
+                    negative_prompt=current_neg,
+                )
+            except RuntimeError as exc:
+                gen_time = time.time() - t0
+                if "out of memory" in str(exc).lower():
+                    logger.warning(
+                        "Attempt %d hit CUDA OOM after %.2fs — clearing cache and continuing.",
+                        attempt,
+                        gen_time,
+                    )
+                    _clear_cuda_cache()
+                    # Record a failed attempt with score 0
+                    records.append(
+                        AttemptRecord(
+                            attempt_number=attempt,
+                            seed=current_seed,
+                            steps=current_steps,
+                            guidance_scale=current_cfg,
+                            width=width,
+                            height=height,
+                            quality_score=0.0,
+                            generation_time=gen_time,
+                        )
+                    )
+                    all_images.append(None)  # placeholder for failed attempt
+                    # Reduce steps on next attempt to lower memory pressure
+                    current_steps = max(current_steps - 5, 20)
+                    current_seed = random.randint(0, 2**32 - 1)
+                    continue
+                raise  # non-OOM RuntimeErrors propagate
+
             gen_time = time.time() - t0
 
             score = self._qe.evaluate(prompt, image)
-            logger.info("Attempt %d score: %.4f (threshold %.2f)", attempt, score, self._threshold)
+
+            # ---- debug logging per attempt ----
+            logger.info(
+                "Attempt %d  |  score=%.4f  |  threshold=%.2f  |  "
+                "steps=%d  |  cfg=%.2f  |  seed=%d  |  time=%.2fs",
+                attempt,
+                score,
+                self._threshold,
+                current_steps,
+                current_cfg,
+                current_seed,
+                gen_time,
+            )
 
             record = AttemptRecord(
                 attempt_number=attempt,
@@ -132,19 +192,30 @@ class AdaptiveSampler:
                 best_image = image
                 best_idx = attempt
 
+            # ---- GPU memory cleanup after each attempt ----
+            _clear_cuda_cache()
+
             if score >= self._threshold:
                 logger.info("Quality threshold met at attempt %d.", attempt)
                 break
 
             # ---- parameter adjustment for next attempt ----
-            current_steps = min(current_steps + 10, 100)
-            current_cfg = round(current_cfg * 1.1, 2)
-            current_cfg = min(current_cfg, 20.0)
+            current_steps = min(current_steps + 10, _MAX_STEPS)
+            current_cfg = round(min(current_cfg * 1.1, _MAX_CFG), 2)
             current_seed = random.randint(0, 2**32 - 1)
             if _DEFAULT_NEGATIVE not in current_neg:
                 current_neg = f"{current_neg}, {_DEFAULT_NEGATIVE}"
 
-        assert best_image is not None
+        assert best_image is not None, (
+            "All adaptive sampling attempts failed — no image was produced.  "
+            "This likely indicates persistent CUDA OOM.  Try reducing resolution."
+        )
+        logger.info(
+            "Adaptive loop finished — best attempt=%d  best_score=%.4f  total_attempts=%d",
+            best_idx,
+            best_score,
+            len(records),
+        )
         return SamplingResult(
             best_image=best_image,
             best_attempt=best_idx,

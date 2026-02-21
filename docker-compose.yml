@@ -1,0 +1,39 @@
+services:
+  # ---- FastAPI backend (GPU) ----
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pixelforge-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - PIXELFORGE_SKIP_LOAD=0
+      - PIXELFORGE_JWT_SECRET=${JWT_SECRET:-pixelforge-super-secret-change-me-32b!}
+    volumes:
+      - hf-cache:/app/.cache/huggingface   # persist downloaded models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ---- React frontend (nginx) ----
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: pixelforge-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=/api                # Routed through nginx proxy
+    restart: unless-stopped
+
+volumes:
+  hf-cache:

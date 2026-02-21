@@ -40,16 +40,21 @@ class QualityEvaluator:
         self._w_clip = w_clip
         self._w_face = w_face
         self._w_sharpness = w_sharpness
-        if device is not None:
-            self._device = device
-        else:
-            try:
-                import torch as _torch
-                self._device = "cuda" if _torch.cuda.is_available() else "cpu"
-            except ImportError:
-                self._device = "cpu"
+        self._device: Optional[str] = device  # None → resolved lazily
         self._clip_model: Any = None
         self._clip_processor: Any = None
+
+    def _resolve_device(self) -> None:
+        """Resolve the device, raising if no CUDA GPU is available."""
+        if self._device is not None:
+            return
+        import torch as _torch
+        if not _torch.cuda.is_available():
+            raise RuntimeError(
+                "PixelForge requires an NVIDIA GPU with CUDA support. "
+                "No CUDA device was detected."
+            )
+        self._device = "cuda"
 
     # ---- lifecycle ----------------------------------------------
 
@@ -57,6 +62,8 @@ class QualityEvaluator:
         """Load CLIP model for alignment scoring."""
         if self._clip_model is not None:
             return
+
+        self._resolve_device()
 
         from transformers import CLIPModel as _CLIPModel
         from transformers import CLIPProcessor as _CLIPProcessor

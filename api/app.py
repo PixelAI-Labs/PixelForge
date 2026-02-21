@@ -14,9 +14,13 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from auth.dependencies import get_current_user
+from auth.router import init_user_store, router as auth_router
+from auth.store import UserStore
 from core.models import AttemptRecord, Job
 from engines.adaptive_sampler import AdaptiveSampler
 from engines.model_manager import ModelManager
@@ -57,10 +61,25 @@ def create_app(
     """Build and return a configured FastAPI application."""
 
     app = FastAPI(title="PixelForge", version="0.1.0")
+
+    # CORS — allow frontend dev server and Docker container
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://localhost:5173", "*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Auth setup
+    user_store = UserStore()
+    init_user_store(user_store)
+    app.include_router(auth_router)
+
     store = InMemoryArtifactStore()
     orch = Orchestrator()
 
-    mm = model_manager or ModelManager()
+    mm = model_manager or ModelManager(auto_load=False)
     qe = quality_evaluator or QualityEvaluator()
     sampler = AdaptiveSampler(mm, qe, quality_threshold=quality_threshold)
 
@@ -76,8 +95,11 @@ def create_app(
 
         # Persist images and update records
         for i, rec in enumerate(result.attempts):
+            img = result.images[i] if i < len(result.images) else None
+            if img is None:
+                continue  # skip OOM / failed attempts with no image
             artifact_id = store.save_image(
-                result.images[i],
+                img,
                 job.job_id,
                 rec.attempt_number,
             )
@@ -99,7 +121,17 @@ def create_app(
     # ---- routes -------------------------------------------------
 
     @app.post("/generate", response_model=GenerateResponse)
-    async def generate(req: GenerateRequest, background_tasks: BackgroundTasks) -> GenerateResponse:
+    async def generate(
+        req: GenerateRequest,
+        background_tasks: BackgroundTasks,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> GenerateResponse:
+        if mm._pipe is None and mm._device is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Image generation is unavailable — no GPU model loaded. "
+                       "Set PIXELFORGE_SKIP_LOAD=0 on a CUDA-capable host.",
+            )
         job = Job(prompt=req.prompt, seed=req.seed, negative_prompt=req.negative_prompt)
         orch.submit(job)
         background_tasks.add_task(orch.run_job, job, _execute_job)

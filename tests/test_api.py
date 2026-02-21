@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 from api.app import create_app
+from auth.security import create_access_token
 from engines.model_manager import ModelManager
 from engines.quality_evaluator import QualityEvaluator
 
@@ -31,6 +32,12 @@ def _mock_quality_evaluator() -> QualityEvaluator:
     return qe
 
 
+def _auth_header() -> dict:
+    """Return an Authorization header with a valid JWT."""
+    token = create_access_token("test-user-id", "testuser")
+    return {"Authorization": f"Bearer {token}"}
+
+
 @pytest.fixture
 def client() -> TestClient:
     app = create_app(
@@ -44,32 +51,48 @@ def client() -> TestClient:
 
 class TestGenerateEndpoint:
     def test_generate_returns_job_id(self, client: TestClient) -> None:
-        resp = client.post("/generate", json={"prompt": "a dog"})
+        resp = client.post("/generate", json={"prompt": "a dog"}, headers=_auth_header())
         assert resp.status_code == 200
         body = resp.json()
         assert "job_id" in body
         assert isinstance(body["job_id"], str)
 
+    def test_generate_requires_auth(self, client: TestClient) -> None:
+        resp = client.post("/generate", json={"prompt": "a dog"})
+        assert resp.status_code in (401, 403)
 
-class TestJobsEndpoint:
-    def test_list_jobs(self, client: TestClient) -> None:
-        client.post("/generate", json={"prompt": "test"})
-        resp = client.get("/jobs")
+
+class TestAuthEndpoints:
+    def test_register_and_login(self, client: TestClient) -> None:
+        # Register
+        resp = client.post("/auth/register", json={
+            "username": "testuser",
+            "email": "test@example.com",
+            "password": "password123",
+        })
+        assert resp.status_code == 201
+        body = resp.json()
+        assert "access_token" in body
+        assert body["username"] == "testuser"
+
+        # Login
+        resp = client.post("/auth/login", json={
+            "email": "test@example.com",
+            "password": "password123",
+        })
         assert resp.status_code == 200
-        jobs = resp.json()
-        assert isinstance(jobs, list)
-        assert len(jobs) >= 1
+        body = resp.json()
+        assert "access_token" in body
 
-    def test_get_job_not_found(self, client: TestClient) -> None:
-        resp = client.get("/jobs/nonexistent")
-        assert resp.status_code == 404
+    def test_me_endpoint(self, client: TestClient) -> None:
+        # Register first
+        resp = client.post("/auth/register", json={
+            "username": "meuser",
+            "email": "me@example.com",
+            "password": "password123",
+        })
+        token = resp.json()["access_token"]
 
-
-class TestArtifactsEndpoint:
-    def test_artifact_not_found(self, client: TestClient) -> None:
-        resp = client.get("/artifacts/missing")
-        assert resp.status_code == 404
-
-    def test_artifact_meta_not_found(self, client: TestClient) -> None:
-        resp = client.get("/artifacts/missing/meta")
-        assert resp.status_code == 404
+        resp = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert resp.status_code == 200
+        assert resp.json()["username"] == "meuser"

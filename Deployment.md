@@ -4,7 +4,7 @@
 
 - Python 3.10+
 - Node.js 18+
-- NVIDIA GPU with CUDA 11+
+- NVIDIA GPU with CUDA 11+ (required)
 - 8GB+ VRAM recommended
 
 ---
@@ -35,5 +35,5 @@ NEXT_PUBLIC_API_BASE=http://localhost:8000
 
 ## Notes
 
-- CPU fallback supported but slow.
+- An NVIDIA GPU with CUDA is required. The system will not start without one.
 - Model loaded once at startup.

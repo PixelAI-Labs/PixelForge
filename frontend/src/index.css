@@ -1,0 +1,72 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---- global resets ------------------------------------------- */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* ---- custom utilities ---------------------------------------- */
+@layer utilities {
+  .gradient-text {
+    @apply bg-gradient-to-r from-brand-400 via-purple-400 to-pink-400 bg-clip-text text-transparent;
+  }
+
+  .glass {
+    @apply bg-dark-700/60 backdrop-blur-xl border border-dark-400/30;
+  }
+
+  .btn-primary {
+    @apply px-6 py-3 rounded-xl font-semibold text-white
+           bg-gradient-to-r from-brand-600 to-purple-600
+           hover:from-brand-500 hover:to-purple-500
+           shadow-lg shadow-brand-600/25
+           transition-all duration-200 ease-out
+           active:scale-[0.97] disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply px-6 py-3 rounded-xl font-semibold
+           border border-dark-400/50 text-dark-50
+           hover:bg-dark-600 hover:border-dark-300/50
+           transition-all duration-200 ease-out
+           active:scale-[0.97];
+  }
+
+  .input-field {
+    @apply w-full px-4 py-3 rounded-xl
+           bg-dark-700/80 border border-dark-400/40
+           text-white placeholder-dark-200
+           focus:outline-none focus:ring-2 focus:ring-brand-500/50 focus:border-brand-500
+           transition-all duration-200;
+  }
+}
+
+/* ---- animation keyframes ------------------------------------- */
+@keyframes float {
+  0%, 100% { transform: translateY(0px); }
+  50% { transform: translateY(-20px); }
+}
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 0.8; }
+}
+@keyframes fade-in-up {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-float { animation: float 6s ease-in-out infinite; }
+.animate-pulse-glow { animation: pulse-glow 3s ease-in-out infinite; }
+.animate-fade-in-up { animation: fade-in-up 0.6s ease-out forwards; }
