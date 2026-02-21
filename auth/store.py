@@ -1,36 +1,68 @@
-"""In-memory user store for authentication."""
+"""MongoDB-backed user store for authentication."""
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Optional
+
+from pymongo.collection import Collection
+from pymongo.database import Database as SyncDatabase
 
 from auth.models import User
 
 
-class UserStore:
-    """Simple in-memory user store."""
+def _user_to_doc(user: User) -> dict:
+    """Serialise a User dataclass to a MongoDB document."""
+    return {
+        "user_id": user.user_id,
+        "username": user.username,
+        "email": user.email.lower(),
+        "hashed_password": user.hashed_password,
+        "created_at": user.created_at,
+        "is_active": user.is_active,
+    }
 
-    def __init__(self) -> None:
-        self._users_by_id: Dict[str, User] = {}
-        self._users_by_email: Dict[str, User] = {}
-        self._users_by_username: Dict[str, User] = {}
+
+def _doc_to_user(doc: dict) -> User:
+    """Deserialise a MongoDB document to a User dataclass."""
+    return User(
+        username=doc["username"],
+        email=doc["email"],
+        hashed_password=doc["hashed_password"],
+        user_id=doc["user_id"],
+        created_at=doc["created_at"],
+        is_active=doc.get("is_active", True),
+    )
+
+
+class UserStore:
+    """MongoDB-backed user store (sync pymongo)."""
+
+    def __init__(self, db: SyncDatabase) -> None:
+        self._col: Collection = db["users"]
+
+    # ---- writes -------------------------------------------------
 
     def add(self, user: User) -> None:
-        self._users_by_id[user.user_id] = user
-        self._users_by_email[user.email.lower()] = user
-        self._users_by_username[user.username.lower()] = user
+        self._col.insert_one(_user_to_doc(user))
+
+    # ---- reads --------------------------------------------------
 
     def get_by_id(self, user_id: str) -> Optional[User]:
-        return self._users_by_id.get(user_id)
+        doc = self._col.find_one({"user_id": user_id})
+        return _doc_to_user(doc) if doc else None
 
     def get_by_email(self, email: str) -> Optional[User]:
-        return self._users_by_email.get(email.lower())
+        doc = self._col.find_one({"email": email.lower()})
+        return _doc_to_user(doc) if doc else None
 
     def get_by_username(self, username: str) -> Optional[User]:
-        return self._users_by_username.get(username.lower())
+        doc = self._col.find_one({"username": {"$regex": f"^{username}$", "$options": "i"}})
+        return _doc_to_user(doc) if doc else None
 
     def email_exists(self, email: str) -> bool:
-        return email.lower() in self._users_by_email
+        return self._col.count_documents({"email": email.lower()}, limit=1) > 0
 
     def username_exists(self, username: str) -> bool:
-        return username.lower() in self._users_by_username
+        return self._col.count_documents(
+            {"username": {"$regex": f"^{username}$", "$options": "i"}}, limit=1
+        ) > 0

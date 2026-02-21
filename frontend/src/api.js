@@ -76,3 +76,24 @@ export async function listJobs() {
 export function artifactUrl(artifactId) {
   return `${BASE}/artifacts/${artifactId}`;
 }
+
+export function jobImageUrl(jobId) {
+  return `${BASE}/jobs/${jobId}/image`;
+}
+
+/**
+ * Fetch the best image for a job as a Blob URL.
+ * Uses auth headers and provides proper error reporting.
+ * Returns { url: string } on success, throws on failure.
+ */
+export async function fetchJobImage(jobId) {
+  const res = await fetch(`${BASE}/jobs/${jobId}/image`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Image fetch failed (${res.status})`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}

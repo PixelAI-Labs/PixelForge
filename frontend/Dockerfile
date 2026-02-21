@@ -7,8 +7,8 @@ COPY package.json ./
 RUN npm install
 COPY . .
 
-# Point API calls at the backend service in Docker network
-ENV VITE_API_URL=http://localhost:8000
+# Route API calls through the nginx proxy (/api → backend:8000)
+ENV VITE_API_URL=/api
 
 RUN npm run build
 

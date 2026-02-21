@@ -22,11 +22,17 @@ from auth.dependencies import get_current_user
 from auth.router import init_user_store, router as auth_router
 from auth.store import UserStore
 from core.models import AttemptRecord, Job
+from db.connection import (
+    close_clients,
+    ensure_indexes,
+    get_sync_db,
+    ping_mongo,
+)
 from engines.adaptive_sampler import AdaptiveSampler
 from engines.model_manager import ModelManager
 from engines.quality_evaluator import QualityEvaluator
 from orchestrator.orchestrator import Orchestrator
-from store.artifact_store import InMemoryArtifactStore
+from store.artifact_store import InMemoryArtifactStore, MongoArtifactStore
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +63,15 @@ def create_app(
     model_manager: Optional[ModelManager] = None,
     quality_evaluator: Optional[QualityEvaluator] = None,
     quality_threshold: float = 0.65,
+    use_memory: bool = False,
 ) -> FastAPI:
-    """Build and return a configured FastAPI application."""
+    """Build and return a configured FastAPI application.
+
+    Parameters
+    ----------
+    use_memory : bool
+        If True, use in-memory stores instead of MongoDB (useful for tests).
+    """
 
     app = FastAPI(title="PixelForge", version="0.1.0")
 
@@ -71,13 +84,31 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Auth setup
-    user_store = UserStore()
-    init_user_store(user_store)
-    app.include_router(auth_router)
+    if use_memory:
+        # In-memory stores for testing (no MongoDB required)
+        from tests._inmemory_user_store import InMemoryUserStore
+        user_store = InMemoryUserStore()  # type: ignore[arg-type]
+        init_user_store(user_store)
+        app.include_router(auth_router)
+        store = InMemoryArtifactStore()
+        orch = Orchestrator()
+    else:
+        # MongoDB-backed stores (production)
+        sync_db = get_sync_db()
+        user_store = UserStore(sync_db)  # type: ignore[arg-type]
+        init_user_store(user_store)
+        app.include_router(auth_router)
+        store = MongoArtifactStore(sync_db)
+        orch = Orchestrator(db=sync_db)
 
-    store = InMemoryArtifactStore()
-    orch = Orchestrator()
+        @app.on_event("startup")
+        async def _startup() -> None:
+            await ping_mongo()
+            await ensure_indexes()
+
+        @app.on_event("shutdown")
+        async def _shutdown() -> None:
+            close_clients()
 
     mm = model_manager or ModelManager(auto_load=False)
     qe = quality_evaluator or QualityEvaluator()
@@ -159,6 +190,17 @@ def create_app(
         data = store.get_image_bytes(artifact_id)
         if data is None:
             raise HTTPException(status_code=404, detail="Artifact not found")
+        return Response(content=data, media_type="image/png")
+
+    @app.get("/jobs/{job_id}/image")
+    async def get_job_image(job_id: str) -> Response:
+        """Return the best generated image for a completed job."""
+        logger.info("Image request for job_id=%s", job_id)
+        data = store.get_best_image_bytes(job_id)
+        if data is None:
+            logger.warning("No image found for job_id=%s", job_id)
+            raise HTTPException(status_code=404, detail="No image found for this job")
+        logger.info("Serving image for job_id=%s (%d bytes)", job_id, len(data))
         return Response(content=data, media_type="image/png")
 
     @app.get("/artifacts/{artifact_id}/meta")

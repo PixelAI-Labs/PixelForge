@@ -95,5 +95,9 @@ async def me(current_user: Dict[str, Any] = Depends(get_current_user)) -> MeResp
     store = _store()
     user = store.get_by_id(current_user["sub"])
     if user is None:
-        raise HTTPException(status_code=404, detail="User not found")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User no longer exists — please register again",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
     return MeResponse(user_id=user.user_id, username=user.username, email=user.email)

@@ -14,10 +14,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch with CUDA 12.6 first (must come before requirements.txt
+# Install uv (fast Rust-based pip replacement) — immune to the NVIDIA CDN
+# hash-mismatch issue that breaks pip when nvidia re-publishes wheels.
+RUN pip install --no-cache-dir --break-system-packages uv
+
+# Install PyTorch with CUDA 12.6 (must come before requirements.txt
 # so pip doesn't pull the CPU-only wheel from PyPI).
-RUN pip install --no-cache-dir --break-system-packages \
-        torch torchvision --index-url https://download.pytorch.org/whl/cu126
+RUN uv pip install --system --no-cache \
+        torch torchvision \
+        --index-url https://download.pytorch.org/whl/cu126
 
 # Now install remaining Python deps (torch is already satisfied)
 COPY requirements.txt .

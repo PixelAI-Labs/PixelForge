@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { generateImage, getJob, listJobs, artifactUrl } from '../api';
+import { generateImage, getJob, listJobs, fetchJobImage } from '../api';
 
 const POLL_MS = 2000;
 
@@ -27,6 +27,35 @@ export default function Generate() {
   const [activeJob, setActiveJob] = useState(null);
   const [error, setError] = useState('');
   const pollRef = useRef(null);
+  const [imageUrl, setImageUrl] = useState(null);
+  const [imageError, setImageError] = useState('');
+  const [imageLoading, setImageLoading] = useState(false);
+
+  // Fetch image when active job is completed
+  useEffect(() => {
+    if (!activeJob) { setImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; }); setImageError(''); return; }
+    const status = activeJob.status || activeJob.state;
+    if (status !== 'completed') { setImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; }); setImageError(''); return; }
+
+    let cancelled = false;
+    setImageLoading(true);
+    setImageError('');
+
+    fetchJobImage(activeJob.job_id)
+      .then((url) => {
+        if (!cancelled) {
+          setImageUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return url; });
+          setImageLoading(false);
+        } else {
+          URL.revokeObjectURL(url);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) { setImageError(err.message); setImageLoading(false); }
+      });
+
+    return () => { cancelled = true; };
+  }, [activeJob?.job_id, activeJob?.status, activeJob?.state]);
 
   // Poll active job
   useEffect(() => {
@@ -205,12 +234,24 @@ export default function Generate() {
                 {/* Image area */}
                 <div className="aspect-square rounded-xl bg-dark-800 border border-dark-400/20 flex items-center justify-center overflow-hidden">
                   {(activeJob.status || activeJob.state) === 'completed' ? (
-                    <img
-                      src={artifactUrl(activeJob.job_id)}
-                      alt="Generated"
-                      className="w-full h-full object-contain"
-                      onError={(e) => { e.target.style.display = 'none'; }}
-                    />
+                    imageLoading ? (
+                      <div className="flex flex-col items-center gap-3 text-dark-200">
+                        <div className="animate-spin rounded-full h-10 w-10 border-t-2 border-brand-500" />
+                        <p className="text-sm">Loading image…</p>
+                      </div>
+                    ) : imageError ? (
+                      <div className="text-center text-red-400 px-4">
+                        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="mx-auto mb-2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                        <p className="text-sm font-medium mb-1">Image unavailable</p>
+                        <p className="text-xs text-red-400/70">{imageError}</p>
+                      </div>
+                    ) : imageUrl ? (
+                      <img
+                        src={imageUrl}
+                        alt="Generated"
+                        className="w-full h-full object-contain"
+                      />
+                    ) : null
                   ) : (activeJob.status || activeJob.state) === 'failed' ? (
                     <div className="text-center text-red-400">
                       <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="mx-auto mb-2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>

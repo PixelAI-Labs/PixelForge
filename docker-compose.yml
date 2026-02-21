@@ -1,4 +1,20 @@
 services:
+  # ---- MongoDB ----
+  mongo:
+    image: mongo:7
+    container_name: pixelforge-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   # ---- FastAPI backend (GPU) ----
   backend:
     build:
@@ -10,8 +26,13 @@ services:
     environment:
       - PIXELFORGE_SKIP_LOAD=0
       - PIXELFORGE_JWT_SECRET=${JWT_SECRET:-pixelforge-super-secret-change-me-32b!}
+      - MONGO_URL=mongodb://mongo:27017
+      - MONGO_DB_NAME=pixelforge
     volumes:
       - hf-cache:/app/.cache/huggingface   # persist downloaded models
+    depends_on:
+      mongo:
+        condition: service_healthy
     deploy:
       resources:
         reservations:
@@ -36,4 +57,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  mongo-data:
   hf-cache:

@@ -43,6 +43,7 @@ def client() -> TestClient:
     app = create_app(
         model_manager=_mock_model_manager(),
         quality_evaluator=_mock_quality_evaluator(),
+        use_memory=True,
     )
     return TestClient(app)
 

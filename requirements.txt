@@ -6,6 +6,10 @@ pydantic[email]>=2.0.0
 PyJWT>=2.8.0
 bcrypt>=4.0.0
 
+# Database
+pymongo>=4.6.0
+motor>=3.3.0
+
 # ML  (torch is installed separately with CUDA in the Dockerfile)
 # torch>=2.6.0
 diffusers>=0.25.0
