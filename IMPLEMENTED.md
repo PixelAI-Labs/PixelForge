@@ -12,6 +12,7 @@ A complete reference of every implemented function, method, and component in the
   - [core/models.py — Domain Models](#coremodelspy--domain-models)
   - [engines/model_manager.py — Stable Diffusion Pipeline](#enginesmodel_managerpy--stable-diffusion-pipeline)
   - [engines/quality_evaluator.py — Image Quality Scoring](#enginesquality_evaluatorpy--image-quality-scoring)
+  - [engines/prompt_pipeline.py — Prompt Preprocessing Pipeline](#enginesprompt_pipelinepy--prompt-preprocessing-pipeline)
   - [engines/adaptive_sampler.py — Feedback-Driven Regeneration](#enginesadaptive_samplerpy--feedback-driven-regeneration)
   - [orchestrator/orchestrator.py — Job Queue & GPU Mutex](#orchestratororchestratopy--job-queue--gpu-mutex)
   - [store/artifact_store.py — Image & Metadata Persistence](#storeartifact_storepy--image--metadata-persistence)
@@ -41,7 +42,7 @@ A complete reference of every implemented function, method, and component in the
 
 | Symbol | Type | What It Does |
 |--------|------|-------------|
-| Module-level code | Script | Configures logging, creates `ModelManager` and `QualityEvaluator` instances, verifies the MongoDB connection, and builds the FastAPI `app` via `create_app()`. Respects `PIXELFORGE_SKIP_LOAD` env var to defer GPU model loading during tests. |
+| Module-level code | Script | Configures logging, creates `ModelManager`, `QualityEvaluator`, and `PromptPipeline` instances, verifies the MongoDB connection, and builds the FastAPI `app` via `create_app()`. Respects `PIXELFORGE_SKIP_LOAD` env var to defer GPU model loading and disable the prompt pipeline during tests. |
 
 ---
 
@@ -52,7 +53,7 @@ A complete reference of every implemented function, method, and component in the
 | `GenerateRequest` | Pydantic Model | Validates incoming generation requests (`prompt`, optional `seed`, optional `negative_prompt`). |
 | `GenerateResponse` | Pydantic Model | Returns the `job_id` of a submitted generation job. |
 | `JobStatusResponse` | Pydantic Model | Returns job status fields: `job_id`, `status`, `attempts`, `best_score`, `error`. |
-| `create_app(model_manager, quality_evaluator, quality_threshold, use_memory)` | Factory Function | Builds and configures the FastAPI application. Sets up CORS, selects MongoDB or in-memory stores, initialises the user store, creates the `AdaptiveSampler` and `Orchestrator`, registers all route handlers, and wires up startup/shutdown lifecycle events. |
+| `create_app(model_manager, quality_evaluator, prompt_pipeline, quality_threshold, use_memory)` | Factory Function | Builds and configures the FastAPI application. Sets up CORS, selects MongoDB or in-memory stores, initialises the user store, creates the `AdaptiveSampler` (with optional `PromptPipeline`) and `Orchestrator`, registers all route handlers, and wires up startup/shutdown lifecycle events. |
 | `_execute_job(job)` | Inner Function | Blocking callback passed to the orchestrator. Runs the adaptive sampler, persists each generated image via the artifact store, saves attempt metadata, and updates the `Job` model with results. |
 | `POST /generate` | Route | Accepts a `GenerateRequest`, creates a `Job`, submits it to the orchestrator, and schedules execution as a FastAPI background task. Returns the `job_id`. Requires JWT auth. Returns 503 if no GPU model is loaded. |
 | `GET /jobs` | Route | Returns a list of all submitted jobs (as dicts) from the orchestrator. |
@@ -108,14 +109,30 @@ A complete reference of every implemented function, method, and component in the
 
 ---
 
+### `engines/prompt_pipeline.py` — Prompt Preprocessing Pipeline
+
+A three-stage pipeline that preprocesses user prompts before image generation: spelling correction → grammar correction → diffusion-friendly enhancement.
+
+| Symbol | Type | What It Does |
+|--------|------|-------------|
+| `PromptPipeline.__init__(enabled, device)` | Constructor | Stores the enable flag and device (default `"cpu"`). Initialises a threading lock for lazy model loading. No models are loaded until first use. |
+| `PromptPipeline.process(prompt)` | Method | Runs all three stages sequentially and returns `(enhanced_prompt, negative_prompt)`. When disabled, returns the original prompt with a default negative prompt unchanged. Logs the output of each stage. |
+| `PromptPipeline._ensure_symspell()` | Method | Thread-safe lazy loader for the SymSpell dictionary. Uses double-checked locking to load the built-in English frequency dictionary exactly once. |
+| `PromptPipeline._correct_spelling(text)` | Method | **Stage 1** — Applies SymSpell `lookup_compound` with max edit distance 2 to correct misspelled words across the full prompt. |
+| `PromptPipeline._ensure_grammar_model()` | Method | Thread-safe lazy loader for the Flan-T5-small model and tokenizer from HuggingFace. Loads onto the configured device in eval mode exactly once. |
+| `PromptPipeline._correct_grammar(text)` | Method | **Stage 2** — Sends the prompt to Flan-T5-small with the instruction `"Correct the grammar of this sentence: <text>"`. Uses deterministic generation (no sampling, max 128 new tokens). Returns the corrected text. |
+| `PromptPipeline._enhance(text)` | Static Method | **Stage 3** — Rule-based enhancement. Prefixes short prompts (<8 words) with `"Highly detailed image of"`. Appends quality keywords (`cinematic lighting, ultra sharp focus, 4k resolution`) if none are already present. Returns the enhanced prompt and a default negative prompt (`"blurry, distorted, low resolution, extra limbs, malformed anatomy"`). |
+
+---
+
 ### `engines/adaptive_sampler.py` — Feedback-Driven Regeneration
 
 | Symbol | Type | What It Does |
 |--------|------|-------------|
 | `SamplingResult` | Dataclass | Holds the final output of an adaptive loop: `best_image`, `best_attempt` index, list of `AttemptRecord`s, and all generated images. |
 | `_clear_cuda_cache()` | Module Function | Calls `torch.cuda.empty_cache()` if CUDA is available; silently skips if torch is not installed. |
-| `AdaptiveSampler.__init__(model_manager, quality_evaluator, quality_threshold, max_attempts)` | Constructor | Stores references to the `ModelManager` and `QualityEvaluator`, along with the quality threshold (default 0.65) and max attempts (default 3). |
-| `AdaptiveSampler.run(prompt, seed, steps, guidance_scale, width, height, negative_prompt)` | Method | Executes the full adaptive sampling loop: generates an image, evaluates quality, and if below threshold, adjusts parameters (increases steps by 10, multiplies CFG by 1.1, changes seed, strengthens negative prompt) and retries up to `max_attempts` times. Handles CUDA OOM gracefully by reducing steps. Clears GPU memory after each attempt. Returns a `SamplingResult` with the best image and all attempt records. |
+| `AdaptiveSampler.__init__(model_manager, quality_evaluator, quality_threshold, max_attempts, prompt_pipeline)` | Constructor | Stores references to the `ModelManager`, `QualityEvaluator`, and optional `PromptPipeline`, along with the quality threshold (default 0.65) and max attempts (default 3). |
+| `AdaptiveSampler.run(prompt, seed, steps, guidance_scale, width, height, negative_prompt)` | Method | If a `PromptPipeline` is attached, preprocesses the prompt through spelling correction, grammar correction, and diffusion-friendly enhancement before generation. Merges the pipeline's negative prompt with any user-supplied one. Then executes the adaptive sampling loop: generates an image, evaluates quality, and if below threshold, adjusts parameters (increases steps by 10, multiplies CFG by 1.1, changes seed, strengthens negative prompt) and retries up to `max_attempts` times. Handles CUDA OOM gracefully by reducing steps. Clears GPU memory after each attempt. Logs original, corrected, and enhanced prompts. Returns a `SamplingResult` with the best image and all attempt records. |
 
 ---
 
