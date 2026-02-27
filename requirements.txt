@@ -22,6 +22,9 @@ opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 numpy>=1.24.0
 
+# Prompt preprocessing
+symspellpy>=6.7.0
+
 # Testing
 pytest>=7.0.0
 httpx>=0.24.0

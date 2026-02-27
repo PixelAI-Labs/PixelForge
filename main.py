@@ -10,6 +10,7 @@ import os
 from api.app import create_app
 from db.connection import verify_sync_connection
 from engines.model_manager import ModelManager
+from engines.prompt_pipeline import PromptPipeline
 from engines.quality_evaluator import QualityEvaluator
 
 logging.basicConfig(
@@ -24,6 +25,7 @@ _skip_load = os.getenv("PIXELFORGE_SKIP_LOAD") == "1"
 
 _mm = ModelManager(auto_load=not _skip_load)
 _qe = QualityEvaluator()
+_pp = PromptPipeline(enabled=not _skip_load)
 
 if not _skip_load:
     _qe.load()
@@ -35,4 +37,9 @@ if _mongo_ok:
 else:
     logger.warning("MongoDB not reachable — falling back to in-memory stores.")
 
-app = create_app(model_manager=_mm, quality_evaluator=_qe, use_memory=not _mongo_ok)
+app = create_app(
+    model_manager=_mm,
+    quality_evaluator=_qe,
+    prompt_pipeline=_pp,
+    use_memory=not _mongo_ok,
+)

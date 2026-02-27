@@ -33,6 +33,7 @@ from PIL import Image
 
 from core.models import AttemptRecord
 from engines.model_manager import ModelManager
+from engines.prompt_pipeline import PromptPipeline
 from engines.quality_evaluator import QualityEvaluator
 
 logger = logging.getLogger(__name__)
@@ -77,11 +78,13 @@ class AdaptiveSampler:
         quality_evaluator: QualityEvaluator,
         quality_threshold: float = _DEFAULT_QUALITY_THRESHOLD,
         max_attempts: int = _MAX_ATTEMPTS,
+        prompt_pipeline: Optional[PromptPipeline] = None,
     ) -> None:
         self._mm = model_manager
         self._qe = quality_evaluator
         self._threshold = quality_threshold
         self._max_attempts = max_attempts
+        self._pipeline = prompt_pipeline
 
     # ---- adaptive loop ------------------------------------------
 
@@ -96,6 +99,23 @@ class AdaptiveSampler:
         negative_prompt: str = "",
     ) -> SamplingResult:
         """Execute the adaptive sampling loop and return the best result."""
+
+        # ---- prompt preprocessing pipeline ----
+        if self._pipeline is not None:
+            logger.info("PromptPipeline | original prompt: %r", prompt)
+            enhanced_prompt, pipeline_negative = self._pipeline.process(prompt)
+            prompt = enhanced_prompt
+            # Merge pipeline negative with any user-supplied negative prompt
+            if negative_prompt:
+                negative_prompt = f"{negative_prompt}, {pipeline_negative}"
+            else:
+                negative_prompt = pipeline_negative
+            logger.info(
+                "PromptPipeline | final prompt: %r  |  negative: %r",
+                prompt,
+                negative_prompt,
+            )
+
         best_image: Optional[Image.Image] = None
         best_score: float = -1.0
         best_idx: int = 0

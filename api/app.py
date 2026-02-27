@@ -30,6 +30,7 @@ from db.connection import (
 )
 from engines.adaptive_sampler import AdaptiveSampler
 from engines.model_manager import ModelManager
+from engines.prompt_pipeline import PromptPipeline
 from engines.quality_evaluator import QualityEvaluator
 from orchestrator.orchestrator import Orchestrator
 from store.artifact_store import InMemoryArtifactStore, MongoArtifactStore
@@ -62,6 +63,7 @@ class JobStatusResponse(BaseModel):
 def create_app(
     model_manager: Optional[ModelManager] = None,
     quality_evaluator: Optional[QualityEvaluator] = None,
+    prompt_pipeline: Optional[PromptPipeline] = None,
     quality_threshold: float = 0.65,
     use_memory: bool = False,
 ) -> FastAPI:
@@ -112,7 +114,12 @@ def create_app(
 
     mm = model_manager or ModelManager(auto_load=False)
     qe = quality_evaluator or QualityEvaluator()
-    sampler = AdaptiveSampler(mm, qe, quality_threshold=quality_threshold)
+    pp = prompt_pipeline
+    sampler = AdaptiveSampler(
+        mm, qe,
+        quality_threshold=quality_threshold,
+        prompt_pipeline=pp,
+    )
 
     # ---- helpers ------------------------------------------------
 
