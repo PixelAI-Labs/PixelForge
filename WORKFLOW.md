@@ -34,14 +34,14 @@ User ──► React SPA ──► FastAPI ──► Orchestrator ──► Adap
                                           ┌───────────┼───────────┐
                                           ▼           ▼           ▼
                                    PromptPipeline  ModelManager  QualityEvaluator
-                                   (SymSpell +     (SD 1.5)     (CLIP + Sharpness)
-                                    Flan-T5)
+                                   (SymSpell +     (SD 1.5)     (CLIP + Sharpness
+                                    Flan-T5)                     + LLaVA alignment)
                                                       │
                                                       ▼
                                                ArtifactStore ──► MongoDB
 ```
 
-A user types a text prompt in the React frontend. The prompt travels through a FastAPI endpoint, is queued by the Orchestrator, preprocessed by the PromptPipeline, and fed into a feedback-driven adaptive sampling loop. Stable Diffusion 1.5 generates images which are scored by CLIP alignment and Laplacian sharpness. The best image is persisted to MongoDB and served back to the frontend.
+A user types a text prompt in the React frontend. The prompt travels through a FastAPI endpoint, is queued by the Orchestrator, preprocessed by the PromptPipeline, and fed into a feedback-driven adaptive sampling loop. Stable Diffusion 1.5 generates images which are scored by CLIP alignment and Laplacian sharpness (driving steps/CFG adjustments), while LLaVA evaluates prompt alignment by describing the image and rating how well it matches the original prompt. The best image is persisted to MongoDB and served back to the frontend.
 
 ---
 
@@ -53,7 +53,7 @@ A user types a text prompt in the React frontend. The prompt travels through a F
 |------|--------|--------|
 | 1 | Configure logging | `main.py` |
 | 2 | Instantiate `ModelManager` — loads SD 1.5 onto CUDA GPU | `engines/model_manager.py` |
-| 3 | Instantiate `QualityEvaluator` — loads CLIP ViT-B/32 | `engines/quality_evaluator.py` |
+| 3 | Instantiate `QualityEvaluator` — loads CLIP ViT-B/32 + LLaVA 1.5-7B (4-bit) | `engines/quality_evaluator.py` |
 | 4 | Instantiate `PromptPipeline` (lazy-loads SymSpell + Flan-T5 on first use) | `engines/prompt_pipeline.py` |
 | 5 | Verify MongoDB connectivity via `verify_sync_connection()` | `db/connection.py` |
 | 6 | Call `create_app()` — wire middleware, auth, routes, stores | `api/app.py` |
@@ -190,15 +190,16 @@ The core feedback loop that maximises image quality:
   attempt = 1
   ┌─────────────────────────────────────────────┐
   │  1. Generate image via ModelManager          │
-  │  2. Score via QualityEvaluator               │
-  │  3. If score ≥ threshold (0.80) → accept     │
-  │  4. Else:                                    │
+  │  2. Score via QualityEvaluator (CLIP+sharp)  │
+  │  3. Evaluate prompt alignment via LLaVA      │
+  │  4. If score ≥ threshold (0.80) → accept     │
+  │  5. Else:                                    │
   │     • steps += 10  (max 100)                 │
   │     • cfg *= 1.1   (max 20.0)                │
   │     • new random seed                        │
   │     • strengthen negative prompt             │
-  │  5. Clear CUDA cache                         │
-  │  6. attempt += 1                             │
+  │  6. Clear CUDA cache                         │
+  │  7. attempt += 1                             │
   └───────────────┬─────────────────────────────┘
                   │  repeat up to 10 attempts
                   ▼
@@ -210,6 +211,8 @@ The loop returns a `SamplingResult` containing:
 - `best_attempt` — 1-indexed attempt number
 - `attempts` — list of `AttemptRecord` with full metadata
 - `images` — all generated images (including failed OOM placeholders)
+- `llava_scores` — per-attempt LLaVA prompt-alignment scores [0, 1]
+- `llava_descriptions` — per-attempt LLaVA textual assessments
 
 ### 4.6 Image Generation (Stable Diffusion)
 
@@ -243,6 +246,17 @@ Each generated image is scored on two metrics:
 **Combined score** = `(w_clip × clip + w_sharpness × sharpness) / total_weight`, clamped to [0, 1].
 
 The adaptive loop compares this score against the threshold (default 0.80) to decide whether to accept or retry.
+
+#### LLaVA Prompt Alignment (separate channel)
+
+Alongside the CLIP+sharpness quality score, each generated image is also evaluated by **LLaVA 1.5-7B** (loaded in 4-bit quantisation):
+
+| Method | Purpose |
+|--------|---------|
+| `describe_image(image)` | Generates a detailed natural-language description of the image |
+| `prompt_alignment_score(prompt, image)` | Asks LLaVA to rate how well the image matches the original user prompt (1–10 scale, normalised to [0, 1]) |
+
+LLaVA alignment is **logged per attempt** but does not currently affect the accept/reject decision or parameter adjustments. It provides the foundation for future **prompt-level feedback** — automatically rewriting the prompt when LLaVA detects a mismatch between what was requested and what was generated.
 
 ### 4.8 Artifact Persistence
 

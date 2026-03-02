@@ -28,7 +28,8 @@ _qe = QualityEvaluator()
 _pp = PromptPipeline(enabled=not _skip_load)
 
 if not _skip_load:
-    _qe.load()
+    _qe.load()        # CLIP for quality scoring (steps/CFG feedback)
+    _qe.load_llava()  # LLaVA for prompt-alignment evaluation
 
 # Verify MongoDB is reachable before creating the app
 _mongo_ok = verify_sync_connection()
