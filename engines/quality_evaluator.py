@@ -69,32 +69,68 @@ class QualityEvaluator:
         from transformers import CLIPProcessor as _CLIPProcessor
 
         logger.info("Loading CLIP model for quality evaluation …")
-        self._clip_processor = _CLIPProcessor.from_pretrained(_CLIP_MODEL_ID)
-        self._clip_model = _CLIPModel.from_pretrained(_CLIP_MODEL_ID).to(self._device)
-        self._clip_model.eval()
-        logger.info("CLIP model loaded.")
+        try:
+            self._clip_processor = _CLIPProcessor.from_pretrained(_CLIP_MODEL_ID)
+            self._clip_model = _CLIPModel.from_pretrained(_CLIP_MODEL_ID).to(self._device)
+            self._clip_model.eval()
+            logger.info("CLIP model loaded.")
+        except (OSError, RuntimeError, Exception) as exc:
+            logger.warning(
+                "Could not load CLIP model (%s). "
+                "Quality evaluation will use sharpness only.",
+                exc,
+            )
+            self._clip_model = None
+            self._clip_processor = None
+            self._w_clip = 0.0
 
     # ---- scoring ------------------------------------------------
 
     def clip_score(self, prompt: str, image: Image.Image) -> float:
-        """Cosine similarity between prompt and image via CLIP."""
+        """True cosine similarity between prompt and image CLIP embeddings.
+
+        1. Extract image & text embeddings independently.
+        2. L2-normalise both vectors.
+        3. Compute cosine = dot(image_norm, text_norm)  →  [-1, 1].
+        4. Remap to [0, 1] for downstream scoring.
+        """
         if self._clip_model is None or self._clip_processor is None:
-            raise RuntimeError("CLIP model not loaded — call load() first.")
+            return 0.0
 
         import torch as _torch
+        import torch.nn.functional as _F
 
-        inputs = self._clip_processor(
-            text=[prompt], images=image, return_tensors="pt", padding=True
+        # Tokenise text and preprocess image separately
+        text_inputs = self._clip_processor(
+            text=[prompt], return_tensors="pt", padding=True
         )
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        image_inputs = self._clip_processor(
+            images=image, return_tensors="pt"
+        )
 
         with _torch.no_grad():
-            outputs = self._clip_model(**inputs)
+            # Compute image embedding: vision_model → pooler_output → projection
+            vision_out = self._clip_model.vision_model(
+                pixel_values=image_inputs["pixel_values"].to(self._device),
+            )
+            image_emb = self._clip_model.visual_projection(vision_out.pooler_output)
 
-        logits = outputs.logits_per_image  # (1, 1)
-        # logits_per_image is already a cosine-similarity scaled by a temperature
-        # Normalise to 0-1 range using sigmoid
-        score = _torch.sigmoid(logits).item()
+            # Compute text embedding: text_model → pooler_output → projection
+            text_out = self._clip_model.text_model(
+                input_ids=text_inputs["input_ids"].to(self._device),
+                attention_mask=text_inputs["attention_mask"].to(self._device),
+            )
+            text_emb = self._clip_model.text_projection(text_out.pooler_output)
+
+        # L2-normalise so dot product == cosine similarity
+        image_emb = _F.normalize(image_emb, p=2, dim=-1)
+        text_emb = _F.normalize(text_emb, p=2, dim=-1)
+
+        # cosine ∈ [-1, 1]
+        cosine = (image_emb * text_emb).sum(dim=-1).item()
+
+        # Remap [-1, 1] → [0, 1] for the combined quality score
+        score = (cosine + 1.0) / 2.0
         return float(score)
 
     @staticmethod

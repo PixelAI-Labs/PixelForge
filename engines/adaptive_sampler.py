@@ -14,7 +14,7 @@ Algorithm (from DESIGN.md / DRD):
 6. Return best result
 
 Constraints:
-* Max 3 attempts
+* Max 10 attempts
 * Small parameter deltas
 * Log every attempt with full debug info
 * Clear GPU memory after each attempt (CUDA)
@@ -38,8 +38,8 @@ from engines.quality_evaluator import QualityEvaluator
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_QUALITY_THRESHOLD = 0.65
-_MAX_ATTEMPTS = 3
+_DEFAULT_QUALITY_THRESHOLD = 0.80
+_MAX_ATTEMPTS = 10
 _MAX_STEPS = 100
 _MAX_CFG = 20.0
 _DEFAULT_NEGATIVE = "blurry, distorted, low quality, artifacts"

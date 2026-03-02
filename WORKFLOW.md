@@ -191,7 +191,7 @@ The core feedback loop that maximises image quality:
   ┌─────────────────────────────────────────────┐
   │  1. Generate image via ModelManager          │
   │  2. Score via QualityEvaluator               │
-  │  3. If score ≥ threshold (0.65) → accept     │
+  │  3. If score ≥ threshold (0.80) → accept     │
   │  4. Else:                                    │
   │     • steps += 10  (max 100)                 │
   │     • cfg *= 1.1   (max 20.0)                │
@@ -200,7 +200,7 @@ The core feedback loop that maximises image quality:
   │  5. Clear CUDA cache                         │
   │  6. attempt += 1                             │
   └───────────────┬─────────────────────────────┘
-                  │  repeat up to 3 attempts
+                  │  repeat up to 10 attempts
                   ▼
            Return best image
 ```
@@ -236,13 +236,13 @@ Each generated image is scored on two metrics:
 
 | Metric | Weight | Method |
 |--------|--------|--------|
-| CLIP alignment | 0.5 | Cosine similarity between prompt and image embeddings via `openai/clip-vit-base-patch32` |
+| CLIP alignment | 0.5 | True cosine similarity between L2-normalised image and text embeddings via `openai/clip-vit-base-patch32`, remapped from [-1, 1] to [0, 1]. Falls back to 0 (sharpness-only) if CLIP cannot be loaded (e.g. offline with no cache). |
 | Sharpness | 0.5 | Laplacian variance via OpenCV, normalised to 0–1 |
 | Face detection | 0.0 | Placeholder (hardcoded to 0.0) |
 
 **Combined score** = `(w_clip × clip + w_sharpness × sharpness) / total_weight`, clamped to [0, 1].
 
-The adaptive loop compares this score against the threshold (default 0.65) to decide whether to accept or retry.
+The adaptive loop compares this score against the threshold (default 0.80) to decide whether to accept or retry.
 
 ### 4.8 Artifact Persistence
 
