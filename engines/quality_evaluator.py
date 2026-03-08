@@ -1,24 +1,19 @@
 """QualityEvaluator — scores generated images using CLIP alignment + sharpness.
-LLaVA evaluator — describes the image and checks prompt alignment.
 
 Metrics (from DESIGN.md / Evaluation.md):
 * CLIP alignment  – cosine similarity between prompt & image embeddings
   → drives steps / CFG adjustments in the adaptive loop
 * Sharpness       – Laplacian variance via OpenCV
-* LLaVA alignment – VLM describes the image; semantic match against prompt
-  → drives prompt-level feedback (future: auto-rewrite prompt)
 * Face detection   – Mediapipe confidence (optional, weighted)
 
 Combined score = w1*clip + w2*face + w3*sharpness  (normalised 0-1)
-LLaVA alignment is reported separately for prompt feedback.
-Scoring overhead target: <200 ms (CLIP+sharpness), LLaVA ~1-3 s
+Scoring overhead target: <200 ms
 """
 
 from __future__ import annotations
 
 import logging
-import re
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
 
 import cv2
 import numpy as np
@@ -31,7 +26,6 @@ if TYPE_CHECKING:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 _CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
-_LLAVA_MODEL_ID = "llava-hf/llava-1.5-7b-hf"
 
 
 class QualityEvaluator:
@@ -50,9 +44,6 @@ class QualityEvaluator:
         self._device: Optional[str] = device  # None → resolved lazily
         self._clip_model: Any = None
         self._clip_processor: Any = None
-        # LLaVA (loaded separately via load_llava())
-        self._llava_model: Any = None
-        self._llava_processor: Any = None
 
     def _resolve_device(self) -> None:
         """Resolve the device, raising if no CUDA GPU is available."""
@@ -170,147 +161,3 @@ class QualityEvaluator:
         ) / total_weight
 
         return float(np.clip(score, 0.0, 1.0))
-
-    # ---- LLaVA prompt-alignment evaluation ----------------------
-
-    def load_llava(self) -> None:
-        """Load the LLaVA VLM for image description & prompt alignment.
-
-        Uses 4-bit quantisation to fit alongside SD 1.5 on a single GPU.
-        Gracefully falls back if the model cannot be loaded.
-        """
-        if self._llava_model is not None:
-            return
-
-        self._resolve_device()
-
-        logger.info("Loading LLaVA model (%s) for prompt alignment …", _LLAVA_MODEL_ID)
-        try:
-            import torch as _torch
-            from transformers import (
-                AutoProcessor,
-                BitsAndBytesConfig,
-                LlavaForConditionalGeneration,
-            )
-
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=_torch.float16,
-                bnb_4bit_quant_type="nf4",
-            )
-
-            self._llava_processor = AutoProcessor.from_pretrained(_LLAVA_MODEL_ID)
-            self._llava_model = LlavaForConditionalGeneration.from_pretrained(
-                _LLAVA_MODEL_ID,
-                quantization_config=bnb_config,
-                device_map={"": self._device},
-                torch_dtype=_torch.float16,
-            )
-            self._llava_model.eval()
-            logger.info("LLaVA model loaded (4-bit quantised).")
-        except Exception as exc:
-            logger.warning(
-                "Could not load LLaVA model (%s). "
-                "Prompt-alignment evaluation disabled.",
-                exc,
-            )
-            self._llava_model = None
-            self._llava_processor = None
-
-    @property
-    def llava_available(self) -> bool:
-        """Return True if the LLaVA model is loaded and ready."""
-        return self._llava_model is not None and self._llava_processor is not None
-
-    def describe_image(self, image: Image.Image) -> str:
-        """Use LLaVA to generate a natural-language description of the image.
-
-        Returns an empty string if LLaVA is not loaded.
-        """
-        if not self.llava_available:
-            return ""
-
-        import torch as _torch
-
-        prompt_text = (
-            "USER: <image>\n"
-            "Describe this image in detail. "
-            "Focus on the main subject, style, colours, lighting, and composition.\n"
-            "ASSISTANT:"
-        )
-
-        inputs = self._llava_processor(
-            text=prompt_text,
-            images=image,
-            return_tensors="pt",
-        ).to(self._llava_model.device)
-
-        with _torch.no_grad():
-            output_ids = self._llava_model.generate(
-                **inputs,
-                max_new_tokens=150,
-                do_sample=False,
-            )
-
-        # Decode only the new tokens (skip the input prompt tokens)
-        generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
-        description = self._llava_processor.decode(generated_ids, skip_special_tokens=True).strip()
-        return description
-
-    def prompt_alignment_score(
-        self, prompt: str, image: Image.Image
-    ) -> Tuple[float, str]:
-        """Score how well the image matches the original prompt using LLaVA.
-
-        Asks LLaVA to rate the match on a 1-10 scale and extracts the score.
-
-        Returns
-        -------
-        (score, description) : tuple
-            score ∈ [0, 1]  (normalised from 1-10).
-            description : LLaVA's textual assessment.
-            If LLaVA is unavailable, returns (0.0, "").
-        """
-        if not self.llava_available:
-            return 0.0, ""
-
-        import torch as _torch
-
-        assessment_prompt = (
-            "USER: <image>\n"
-            f"The intended prompt for this image was: \"{prompt}\"\n"
-            "On a scale of 1 to 10, how well does this image match the prompt? "
-            "Give your rating as a single number first, then briefly explain why.\n"
-            "ASSISTANT:"
-        )
-
-        inputs = self._llava_processor(
-            text=assessment_prompt,
-            images=image,
-            return_tensors="pt",
-        ).to(self._llava_model.device)
-
-        with _torch.no_grad():
-            output_ids = self._llava_model.generate(
-                **inputs,
-                max_new_tokens=200,
-                do_sample=False,
-            )
-
-        generated_ids = output_ids[0][inputs["input_ids"].shape[-1]:]
-        response = self._llava_processor.decode(generated_ids, skip_special_tokens=True).strip()
-
-        # Extract numeric rating from the response
-        score = self._parse_rating(response)
-        return score, response
-
-    @staticmethod
-    def _parse_rating(text: str) -> float:
-        """Extract a 1-10 rating from LLaVA's response, normalise to [0, 1]."""
-        # Look for patterns like "8", "8/10", "8 out of 10"
-        match = re.search(r"\b(\d{1,2})(?:\s*/\s*10|\s+out\s+of\s+10)?\b", text)
-        if match:
-            raw = int(match.group(1))
-            raw = max(1, min(raw, 10))
-            return (raw - 1) / 9.0  # map 1→0.0, 10→1.0
-        return 0.5  # default if parsing fails

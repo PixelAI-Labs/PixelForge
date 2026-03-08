@@ -97,3 +97,43 @@ export async function fetchJobImage(jobId) {
   const blob = await res.blob();
   return URL.createObjectURL(blob);
 }
+
+// ---- Iterative Editing ------------------------------------------
+
+export async function createEditSession(prompt, seed = null, negativePrompt = '') {
+  return request('/generate-session', {
+    method: 'POST',
+    body: JSON.stringify({
+      prompt,
+      seed,
+      negative_prompt: negativePrompt,
+    }),
+  });
+}
+
+export async function editImage(sessionId, editInstruction, strength = 0.35) {
+  return request('/edit', {
+    method: 'POST',
+    body: JSON.stringify({
+      session_id: sessionId,
+      edit_instruction: editInstruction,
+      strength,
+    }),
+  });
+}
+
+export async function getSession(sessionId) {
+  return request(`/sessions/${sessionId}`);
+}
+
+export async function fetchSessionImage(sessionId, iteration) {
+  const res = await fetch(`${BASE}/sessions/${sessionId}/image/${iteration}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.detail || `Image fetch failed (${res.status})`);
+  }
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}

@@ -36,7 +36,7 @@ The image display for the **active** job already works via `fetchJobImage()`, bu
 | Detail | Value |
 |--------|-------|
 | **File** | `engines/quality_evaluator.py` |
-| **Line** | 114 |
+| **Line** | 160 |
 | **Current body** | `face = 0.0  # Face detection kept at weight 0 by default` |
 
 ### What it should do

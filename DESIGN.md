@@ -23,7 +23,7 @@ The system treats diffusion as a stochastic search process and uses measurable q
 ```
 ┌──────────────────────────┐
 │        Frontend          │
-│     (Next.js / React)    │
+│     (React + Vite)       │
 └──────────────┬───────────┘
                │ HTTP
                ▼
@@ -72,7 +72,7 @@ The system treats diffusion as a stochastic search process and uses measurable q
 
 ---
 
-## 4.1 Frontend Layer (Next.js)
+## 4.1 Frontend Layer (React + Vite)
 
 ### Responsibilities:
 
@@ -183,16 +183,18 @@ Quantitatively measure image quality.
 
 1. CLIP Alignment
 
-   * Encode prompt
-   * Encode image
-   * Cosine similarity
+   * Extract image & text embeddings via CLIP ViT-B/32
+   * L2-normalise both vectors
+   * True cosine similarity, remapped [-1, 1] → [0, 1]
+   * Graceful fallback to sharpness-only if CLIP unavailable
 
 2. Face Detection Score
 
    * Detect face presence
    * Confidence scoring
+   * *(Placeholder — not yet active, weight = 0)*
 
-3. Sharpness Score
+4. Sharpness Score
 
    * Laplacian variance (OpenCV)
 
@@ -233,14 +235,16 @@ Adjust inference parameters based on feedback.
    * Change seed
    * Strengthen negative prompt
 5. Regenerate
-6. Repeat up to max 3 attempts
+6. Repeat up to max 10 attempts
 7. Select best-scoring image
 
 #### Constraints:
 
-* Max 3 attempts
-* Small parameter deltas
+* Max 10 attempts
+* Quality threshold: 0.80
+* Small parameter deltas (steps +10, CFG ×1.1)
 * Keep best attempt
+* CUDA OOM handling: clear cache, reduce steps, continue
 
 #### Rationale:
 
@@ -295,13 +299,14 @@ Sampling variability is stochastic. Many distortions can be corrected via re-sam
 
 ## 6.1 Machine Learning
 
-| Technology   | Purpose                         | Justification                    |
-| ------------ | ------------------------------- | -------------------------------- |
-| PyTorch      | Core tensor engine              | Industry standard, GPU optimized |
-| Diffusers    | Stable Diffusion implementation | Modular, maintained              |
-| Transformers | CLIP encoding                   | Needed for alignment scoring     |
-| OpenCV       | Sharpness detection             | Efficient image processing       |
-| Mediapipe    | Face detection                  | Lightweight and reliable         |
+| Technology     | Purpose                           | Justification                    |
+| -------------- | --------------------------------- | -------------------------------- |
+| PyTorch        | Core tensor engine                | Industry standard, GPU optimized |
+| Diffusers      | Stable Diffusion implementation   | Modular, maintained              |
+| Transformers   | CLIP + Flan-T5                    | Alignment scoring, grammar correction |
+| OpenCV         | Sharpness detection               | Efficient image processing       |
+| SymSpellPy     | Spelling correction               | Fast compound word correction    |
+| Mediapipe      | Face detection (planned)          | Lightweight and reliable         |
 
 ---
 
@@ -320,8 +325,8 @@ Sampling variability is stochastic. Many distortions can be corrected via re-sam
 
 | Technology   | Purpose          | Justification      |
 | ------------ | ---------------- | ------------------ |
-| Next.js      | UI framework     | Modern, performant |
-| React        | Component system | Declarative UI     |
+| React        | UI framework     | Declarative UI     |
+| Vite         | Build tool       | Fast HMR, modern bundling |
 | Tailwind CSS | Styling          | Rapid development  |
 
 ---
@@ -338,9 +343,10 @@ Sampling variability is stochastic. Many distortions can be corrected via re-sam
 # 7. Performance Design
 
 * GPU-only generation recommended
-* Max 3 regeneration attempts
+* Max 10 regeneration attempts (threshold 0.80)
 * No model reload inside loop
-* Quality scoring under 200ms
+* CLIP + sharpness scoring under 200ms
+* Img2img editing uses shared pipeline weights (no extra VRAM)
 * Single-worker execution
 
 ---

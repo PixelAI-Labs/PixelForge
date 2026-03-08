@@ -3,16 +3,15 @@
 Algorithm (from DESIGN.md / DRD):
 1. Generate initial image
 2. Evaluate quality (CLIP + sharpness → steps/CFG feedback)
-3. Evaluate prompt alignment (LLaVA → prompt feedback, future: auto-rewrite)
-4. If quality >= threshold → accept
-5. Else:
+3. If quality >= threshold → accept
+4. Else:
    - Increase steps (+10, bounded to 100)
    - Multiply CFG by 1.1 (bounded to 20.0)
    - Change seed
    - Strengthen negative prompt
    - Regenerate
-6. Repeat (max 10 attempts)
-7. Return best result
+5. Repeat (max 10 attempts)
+6. Return best result
 
 Constraints:
 * Max 10 attempts
@@ -54,9 +53,6 @@ class SamplingResult:
     best_attempt: int
     attempts: List[AttemptRecord]
     images: List[Optional[Image.Image]] = field(default_factory=list)
-    # LLaVA prompt-alignment data (per attempt)
-    llava_scores: List[float] = field(default_factory=list)
-    llava_descriptions: List[str] = field(default_factory=list)
 
 
 def _clear_cuda_cache() -> None:
@@ -104,9 +100,6 @@ class AdaptiveSampler:
     ) -> SamplingResult:
         """Execute the adaptive sampling loop and return the best result."""
 
-        # Save original prompt for LLaVA alignment (before pipeline rewriting)
-        original_prompt = prompt
-
         # ---- prompt preprocessing pipeline ----
         if self._pipeline is not None:
             logger.info("PromptPipeline | original prompt: %r", prompt)
@@ -128,8 +121,6 @@ class AdaptiveSampler:
         best_idx: int = 0
         records: List[AttemptRecord] = []
         all_images: List[Image.Image] = []
-        llava_scores: List[float] = []
-        llava_descriptions: List[str] = []
 
         current_seed = seed if seed is not None else random.randint(0, 2**32 - 1)
         current_steps = steps
@@ -180,8 +171,6 @@ class AdaptiveSampler:
                         )
                     )
                     all_images.append(None)  # placeholder for failed attempt
-                    llava_scores.append(0.0)
-                    llava_descriptions.append("")
                     # Reduce steps on next attempt to lower memory pressure
                     current_steps = max(current_steps - 5, 20)
                     current_seed = random.randint(0, 2**32 - 1)
@@ -191,22 +180,6 @@ class AdaptiveSampler:
             gen_time = time.time() - t0
 
             score = self._qe.evaluate(prompt, image)
-
-            # ---- LLaVA prompt-alignment evaluation ----
-            llava_align = 0.0
-            llava_desc = ""
-            if self._qe.llava_available:
-                llava_align, llava_desc = self._qe.prompt_alignment_score(
-                    original_prompt, image
-                )
-                logger.info(
-                    "Attempt %d  |  LLaVA alignment=%.2f  |  desc: %.120s",
-                    attempt,
-                    llava_align,
-                    llava_desc,
-                )
-            llava_scores.append(llava_align)
-            llava_descriptions.append(llava_desc)
 
             # ---- debug logging per attempt ----
             logger.info(
@@ -268,6 +241,4 @@ class AdaptiveSampler:
             best_attempt=best_idx,
             attempts=records,
             images=all_images,
-            llava_scores=llava_scores,
-            llava_descriptions=llava_descriptions,
         )

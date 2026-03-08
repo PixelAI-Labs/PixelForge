@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
-import { generateImage, getJob, listJobs, fetchJobImage } from '../api';
+import {
+  generateImage, getJob, listJobs, fetchJobImage,
+  createEditSession, editImage, getSession, fetchSessionImage,
+} from '../api';
 
 const POLL_MS = 2000;
 
@@ -30,6 +33,17 @@ export default function Generate() {
   const [imageUrl, setImageUrl] = useState(null);
   const [imageError, setImageError] = useState('');
   const [imageLoading, setImageLoading] = useState(false);
+
+  // Iterative editing state
+  const [sessionId, setSessionId] = useState(null);
+  const [session, setSession] = useState(null);
+  const [editInstruction, setEditInstruction] = useState('');
+  const [editStrength, setEditStrength] = useState(0.35);
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const [editError, setEditError] = useState('');
+  const [iterationImages, setIterationImages] = useState({});  // { iteration: blobUrl }
+  const [selectedIteration, setSelectedIteration] = useState(null);
+  const sessionPollRef = useRef(null);
 
   // Fetch image when active job is completed
   useEffect(() => {
@@ -84,6 +98,75 @@ export default function Generate() {
   }
 
   useEffect(() => { refreshJobs(); }, []);
+
+  // Poll edit session for new iterations
+  useEffect(() => {
+    if (!sessionId) return;
+    const poll = async () => {
+      try {
+        const s = await getSession(sessionId);
+        setSession(s);
+        // Load images for new iterations
+        for (const it of s.iterations) {
+          if (it.artifact_id && !iterationImages[it.iteration]) {
+            fetchSessionImage(sessionId, it.iteration)
+              .then((url) => {
+                setIterationImages((prev) => ({ ...prev, [it.iteration]: url }));
+              })
+              .catch(() => {});
+          }
+        }
+      } catch { /* ignore */ }
+    };
+    poll();
+    sessionPollRef.current = setInterval(poll, POLL_MS);
+    return () => clearInterval(sessionPollRef.current);
+  }, [sessionId]);
+
+  // Cleanup iteration blob URLs on unmount
+  useEffect(() => {
+    return () => {
+      Object.values(iterationImages).forEach((url) => URL.revokeObjectURL(url));
+    };
+  }, []);
+
+  async function handleEdit(e) {
+    e.preventDefault();
+    if (!editInstruction.trim() || !sessionId) return;
+    setEditError('');
+    setEditSubmitting(true);
+    try {
+      await editImage(sessionId, editInstruction.trim(), editStrength);
+      setEditInstruction('');
+      // Session poll will pick up the new iteration
+    } catch (err) {
+      setEditError(err.message);
+    } finally {
+      setEditSubmitting(false);
+    }
+  }
+
+  async function handleGenerateSession(e) {
+    e.preventDefault();
+    if (!prompt.trim()) return;
+    setError('');
+    setSubmitting(true);
+    setSession(null);
+    setIterationImages({});
+    setSelectedIteration(null);
+    try {
+      const { session_id } = await createEditSession(
+        prompt.trim(),
+        seed ? parseInt(seed, 10) : null,
+        negativePrompt.trim(),
+      );
+      setSessionId(session_id);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   async function handleGenerate(e) {
     e.preventDefault();
@@ -189,6 +272,16 @@ export default function Generate() {
                   </>
                 )}
               </button>
+
+              <button
+                type="button"
+                disabled={submitting || !prompt.trim()}
+                onClick={handleGenerateSession}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-brand-500/50 text-brand-400 hover:bg-brand-600/10 transition-colors text-sm font-medium"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                Generate &amp; Edit Session
+              </button>
             </form>
 
             {/* History */}
@@ -221,7 +314,119 @@ export default function Generate() {
           </div>
 
           {/* Right: Display */}
-          <div className="lg:col-span-3">
+          <div className="lg:col-span-3 space-y-6">
+            {/* Edit Session Panel */}
+            {session && session.iterations.length > 0 && (
+              <div className="glass rounded-2xl p-6 space-y-4 animate-fade-in-up">
+                <h2 className="font-semibold text-lg">
+                  <span className="gradient-text">Edit Session</span>
+                </h2>
+
+                {/* Iteration Timeline */}
+                <div className="flex gap-2 overflow-x-auto pb-2">
+                  {session.iterations.map((it) => (
+                    <button
+                      key={it.iteration}
+                      onClick={() => setSelectedIteration(it.iteration)}
+                      className={`flex-shrink-0 w-20 rounded-lg border-2 overflow-hidden transition-all ${
+                        selectedIteration === it.iteration
+                          ? 'border-brand-500 ring-2 ring-brand-500/30'
+                          : 'border-dark-400/30 hover:border-dark-300'
+                      }`}
+                    >
+                      {iterationImages[it.iteration] ? (
+                        <img src={iterationImages[it.iteration]} alt={`Iteration ${it.iteration}`} className="w-full h-20 object-cover" />
+                      ) : (
+                        <div className="w-full h-20 flex items-center justify-center bg-dark-800">
+                          <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-brand-500" />
+                        </div>
+                      )}
+                      <div className="text-[10px] text-center py-0.5 text-dark-200 truncate px-1">
+                        {it.iteration === 0 ? 'Original' : it.edit_instruction?.slice(0, 12) || `Edit ${it.iteration}`}
+                      </div>
+                    </button>
+                  ))}
+                </div>
+
+                {/* Selected iteration image */}
+                <div className="aspect-square rounded-xl bg-dark-800 border border-dark-400/20 flex items-center justify-center overflow-hidden">
+                  {selectedIteration !== null && iterationImages[selectedIteration] ? (
+                    <img
+                      src={iterationImages[selectedIteration]}
+                      alt={`Iteration ${selectedIteration}`}
+                      className="w-full h-full object-contain"
+                    />
+                  ) : iterationImages[0] ? (
+                    <img
+                      src={iterationImages[0]}
+                      alt="Original"
+                      className="w-full h-full object-contain"
+                    />
+                  ) : (
+                    <div className="flex flex-col items-center gap-3 text-dark-200">
+                      <div className="animate-spin rounded-full h-10 w-10 border-t-2 border-brand-500" />
+                      <p className="text-sm">Generating initial image…</p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Edit form */}
+                <form onSubmit={handleEdit} className="flex gap-2">
+                  <input
+                    type="text"
+                    value={editInstruction}
+                    onChange={(e) => setEditInstruction(e.target.value)}
+                    placeholder="e.g. add neon lights, make it nighttime…"
+                    className="input-field flex-1"
+                  />
+                  <button
+                    type="submit"
+                    disabled={editSubmitting || !editInstruction.trim()}
+                    className="btn-primary px-4 flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {editSubmitting ? (
+                      <div className="animate-spin rounded-full h-4 w-4 border-t-2 border-white" />
+                    ) : (
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+                    )}
+                    Edit
+                  </button>
+                </form>
+
+                {/* Strength slider */}
+                <div className="flex items-center gap-3 text-sm">
+                  <label className="text-dark-200 whitespace-nowrap">Strength: {editStrength.toFixed(2)}</label>
+                  <input
+                    type="range"
+                    min="0.05"
+                    max="0.95"
+                    step="0.05"
+                    value={editStrength}
+                    onChange={(e) => setEditStrength(parseFloat(e.target.value))}
+                    className="flex-1"
+                  />
+                </div>
+
+                {editError && (
+                  <div className="px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
+                    {editError}
+                  </div>
+                )}
+
+                {/* Iteration info */}
+                <div className="grid grid-cols-2 gap-4 text-center">
+                  <div className="glass rounded-xl py-3">
+                    <div className="text-2xl font-bold">{session.iterations.length}</div>
+                    <div className="text-xs text-dark-200">Iterations</div>
+                  </div>
+                  <div className="glass rounded-xl py-3">
+                    <div className="text-2xl font-bold text-sm truncate px-2">{session.original_prompt?.slice(0, 20) || '—'}</div>
+                    <div className="text-xs text-dark-200">Base Prompt</div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {activeJob ? (
               <div className="glass rounded-2xl p-6 space-y-4 animate-fade-in-up">
                 <div className="flex items-center justify-between">

@@ -18,11 +18,12 @@
    - 4.6 [Image Generation (Stable Diffusion)](#46-image-generation-stable-diffusion)
    - 4.7 [Quality Evaluation](#47-quality-evaluation)
    - 4.8 [Artifact Persistence](#48-artifact-persistence)
-5. [Job Polling & Image Retrieval](#5-job-polling--image-retrieval)
-6. [Data Flow Diagram](#6-data-flow-diagram)
-7. [Component Interaction Map](#7-component-interaction-map)
-8. [Error Handling](#8-error-handling)
-9. [Deployment Topology](#9-deployment-topology)
+5. [Iterative Editing Flow](#5-iterative-editing-flow)
+6. [Job Polling & Image Retrieval](#6-job-polling--image-retrieval)
+7. [Data Flow Diagram](#7-data-flow-diagram)
+8. [Component Interaction Map](#8-component-interaction-map)
+9. [Error Handling](#9-error-handling)
+10. [Deployment Topology](#10-deployment-topology)
 
 ---
 
@@ -34,14 +35,15 @@ User ──► React SPA ──► FastAPI ──► Orchestrator ──► Adap
                                           ┌───────────┼───────────┐
                                           ▼           ▼           ▼
                                    PromptPipeline  ModelManager  QualityEvaluator
-                                   (SymSpell +     (SD 1.5)     (CLIP + Sharpness
-                                    Flan-T5)                     + LLaVA alignment)
+                                   (SymSpell +     (SD 1.5       (CLIP + Sharpness)
+                                    Flan-T5)       txt2img +
+                                                    img2img)
                                                       │
                                                       ▼
                                                ArtifactStore ──► MongoDB
 ```
 
-A user types a text prompt in the React frontend. The prompt travels through a FastAPI endpoint, is queued by the Orchestrator, preprocessed by the PromptPipeline, and fed into a feedback-driven adaptive sampling loop. Stable Diffusion 1.5 generates images which are scored by CLIP alignment and Laplacian sharpness (driving steps/CFG adjustments), while LLaVA evaluates prompt alignment by describing the image and rating how well it matches the original prompt. The best image is persisted to MongoDB and served back to the frontend.
+A user types a text prompt in the React frontend. The prompt travels through a FastAPI endpoint, is queued by the Orchestrator, preprocessed by the PromptPipeline, and fed into a feedback-driven adaptive sampling loop. Stable Diffusion 1.5 generates images which are scored by CLIP alignment and Laplacian sharpness. The best image is persisted to MongoDB and served back to the frontend. Users can also create **iterative editing sessions** where they generate an initial image and then apply incremental edits (e.g. "add neon lights") via img2img.
 
 ---
 
@@ -53,7 +55,7 @@ A user types a text prompt in the React frontend. The prompt travels through a F
 |------|--------|--------|
 | 1 | Configure logging | `main.py` |
 | 2 | Instantiate `ModelManager` — loads SD 1.5 onto CUDA GPU | `engines/model_manager.py` |
-| 3 | Instantiate `QualityEvaluator` — loads CLIP ViT-B/32 + LLaVA 1.5-7B (4-bit) | `engines/quality_evaluator.py` |
+| 3 | Instantiate `QualityEvaluator` — loads CLIP ViT-B/32 | `engines/quality_evaluator.py` |
 | 4 | Instantiate `PromptPipeline` (lazy-loads SymSpell + Flan-T5 on first use) | `engines/prompt_pipeline.py` |
 | 5 | Verify MongoDB connectivity via `verify_sync_connection()` | `db/connection.py` |
 | 6 | Call `create_app()` — wire middleware, auth, routes, stores | `api/app.py` |
@@ -191,15 +193,14 @@ The core feedback loop that maximises image quality:
   ┌─────────────────────────────────────────────┐
   │  1. Generate image via ModelManager          │
   │  2. Score via QualityEvaluator (CLIP+sharp)  │
-  │  3. Evaluate prompt alignment via LLaVA      │
-  │  4. If score ≥ threshold (0.80) → accept     │
-  │  5. Else:                                    │
+  │  3. If score ≥ threshold (0.80) → accept     │
+  │  4. Else:                                    │
   │     • steps += 10  (max 100)                 │
   │     • cfg *= 1.1   (max 20.0)                │
   │     • new random seed                        │
   │     • strengthen negative prompt             │
-  │  6. Clear CUDA cache                         │
-  │  7. attempt += 1                             │
+  │  5. Clear CUDA cache                         │
+  │  6. attempt += 1                             │
   └───────────────┬─────────────────────────────┘
                   │  repeat up to 10 attempts
                   ▼
@@ -211,18 +212,22 @@ The loop returns a `SamplingResult` containing:
 - `best_attempt` — 1-indexed attempt number
 - `attempts` — list of `AttemptRecord` with full metadata
 - `images` — all generated images (including failed OOM placeholders)
-- `llava_scores` — per-attempt LLaVA prompt-alignment scores [0, 1]
-- `llava_descriptions` — per-attempt LLaVA textual assessments
 
 ### 4.6 Image Generation (Stable Diffusion)
 
 **File:** `engines/model_manager.py`
 
-`ModelManager.generate()` is the single interface to the diffusion model:
+`ModelManager.generate()` is the single txt2img interface to the diffusion model:
 
 1. Create a `torch.Generator` seeded for reproducibility
 2. Call the `StableDiffusionPipeline` with all parameters (prompt, negative_prompt, steps, CFG, dimensions)
 3. Return the first output image as a `PIL.Image`
+
+`ModelManager.img2img()` provides an img2img interface sharing the same weights:
+
+1. Accept a source `PIL.Image`, prompt, and denoising strength
+2. Call the `StableDiffusionImg2ImgPipeline` (reuses VAE, UNet, text encoder)
+3. Return the transformed image
 
 **Memory optimisations applied at load time:**
 - Attention slicing
@@ -247,17 +252,6 @@ Each generated image is scored on two metrics:
 
 The adaptive loop compares this score against the threshold (default 0.80) to decide whether to accept or retry.
 
-#### LLaVA Prompt Alignment (separate channel)
-
-Alongside the CLIP+sharpness quality score, each generated image is also evaluated by **LLaVA 1.5-7B** (loaded in 4-bit quantisation):
-
-| Method | Purpose |
-|--------|---------|
-| `describe_image(image)` | Generates a detailed natural-language description of the image |
-| `prompt_alignment_score(prompt, image)` | Asks LLaVA to rate how well the image matches the original user prompt (1–10 scale, normalised to [0, 1]) |
-
-LLaVA alignment is **logged per attempt** but does not currently affect the accept/reject decision or parameter adjustments. It provides the foundation for future **prompt-level feedback** — automatically rewriting the prompt when LLaVA detects a mismatch between what was requested and what was generated.
-
 ### 4.8 Artifact Persistence
 
 **File:** `store/artifact_store.py`
@@ -270,7 +264,56 @@ After the adaptive loop completes, `_execute_job()` in `app.py`:
 
 ---
 
-## 5. Job Polling & Image Retrieval
+## 5. Iterative Editing Flow
+
+The iterative editing system lets users refine images through successive img2img edits.
+
+**File:** `engines/iterative_generator.py`, `api/app.py`
+
+```
+User: "A castle on a hill"
+         │
+         ▼  POST /generate-session
+   IterativeGenerator.generate_initial()
+         │  txt2img (512×512, 30 steps)
+         ▼
+   Iteration 0: [castle image]  ← stored in ArtifactStore
+         │
+User: "add neon lights"
+         │
+         ▼  POST /edit  (strength=0.35)
+   IterativeGenerator.edit_image()
+     1. prompt_update("A castle on a hill", "add neon lights")
+        → "A castle on a hill, add neon lights"
+     2. img2img(prev_image, merged_prompt, strength=0.35)
+         │
+         ▼
+   Iteration 1: [castle + neon]  ← stored in ArtifactStore
+         │
+User: "make it nighttime"
+         │
+         ▼  POST /edit  (strength=0.35)
+   Iteration 2: [castle + neon + night]
+```
+
+### Session Lifecycle
+
+1. **Create session** (`POST /generate-session`): Generates initial image via txt2img, creates `EditSession` with `Iteration 0`
+2. **Edit** (`POST /edit`): Loads previous iteration image, merges edit instruction into prompt, runs img2img, creates new `Iteration`
+3. **View session** (`GET /sessions/{id}`): Returns all iterations with metadata
+4. **View iteration image** (`GET /sessions/{id}/image/{n}`): Returns the image for iteration *n*
+
+### Frontend UI
+
+The Generate page shows:
+- **Iteration timeline**: horizontal strip of clickable thumbnails (one per iteration)
+- **Selected image**: large preview of the clicked iteration
+- **Edit form**: text input for edit instructions + strength slider (0.05–0.95)
+- **Stats**: iteration count and base prompt
+
+---
+
+## 6. Job Polling & Image Retrieval
 
 After submission, the frontend polls for completion:
 
@@ -300,7 +343,7 @@ Frontend (2s interval)                   Backend
 
 ---
 
-## 6. Data Flow Diagram
+## 7. Data Flow Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -340,7 +383,7 @@ Frontend (2s interval)                   Backend
 │       │         │  ┌─────────────┐  ┌────────────┐  │              │
 │       │         │  │ Model       │  │ Quality    │  │              │
 │       │         │  │ Manager     │  │ Evaluator  │  │              │
-│       │         │  │ (SD 1.5)    │  │ (CLIP)     │  │              │
+│       │         │  │ (SD 1.5)    │  │(CLIP+sharp)│  │              │
 │       │         │  └──────┬──────┘  └─────┬──────┘  │              │
 │       │         │         │  feedback loop │         │              │
 │       │         │         └───────────────┘         │              │
@@ -364,7 +407,7 @@ Frontend (2s interval)                   Backend
 
 ---
 
-## 7. Component Interaction Map
+## 8. Component Interaction Map
 
 | Component | Depends On | Provides |
 |-----------|-----------|----------|
@@ -377,15 +420,16 @@ Frontend (2s interval)                   Backend
 | `orchestrator/orchestrator.py` | `core/models`, asyncio | Job queue, GPU lock, job lifecycle |
 | `engines/prompt_pipeline.py` | symspellpy, transformers (Flan-T5) | Spelling + grammar + enhancement |
 | `engines/adaptive_sampler.py` | ModelManager, QualityEvaluator, PromptPipeline | Feedback-driven generation loop |
-| `engines/model_manager.py` | diffusers, torch | SD 1.5 pipeline load + generate |
-| `engines/quality_evaluator.py` | transformers (CLIP), OpenCV, numpy | Image quality scoring |
+| `engines/model_manager.py` | diffusers, torch | SD 1.5 pipeline load + generate + img2img |
+| `engines/quality_evaluator.py` | transformers (CLIP), OpenCV, numpy, PIL | Image quality scoring |
+| `engines/iterative_generator.py` | ModelManager | Iterative img2img editing API |
 | `store/artifact_store.py` | pymongo, PIL | Image + metadata persistence |
 | `db/connection.py` | pymongo, motor | Singleton MongoDB clients |
-| `core/models.py` | stdlib only | `Job`, `AttemptRecord`, `JobState` dataclasses |
+| `core/models.py` | stdlib only | `Job`, `AttemptRecord`, `Iteration`, `EditSession`, `JobState` dataclasses |
 
 ---
 
-## 8. Error Handling
+## 9. Error Handling
 
 | Scenario | Where Caught | Recovery |
 |----------|-------------|----------|
@@ -396,12 +440,14 @@ Frontend (2s interval)                   Backend
 | All attempts fail (persistent OOM) | `adaptive_sampler.py` | `AssertionError` → job marked `FAILED` |
 | Job not found | `api/app.py` | 404 Not Found |
 | Artifact/image not found | `api/app.py` | 404 Not Found |
+| Edit session not found | `api/app.py` | 404 Not Found |
+| Edit on session with no image yet | `api/app.py` | 409 Conflict |
 | MongoDB unreachable at startup | `main.py` | Fall back to in-memory stores |
 | Unhandled exception in job | `orchestrator.py` | Job marked `FAILED`, error string persisted |
 
 ---
 
-## 9. Deployment Topology
+## 10. Deployment Topology
 
 **Docker Compose** (`docker-compose.yml`) defines three services:
 

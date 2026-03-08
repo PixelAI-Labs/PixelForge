@@ -12,6 +12,7 @@ A complete reference of every implemented function, method, and component in the
   - [core/models.py — Domain Models](#coremodelspy--domain-models)
   - [engines/model_manager.py — Stable Diffusion Pipeline](#enginesmodel_managerpy--stable-diffusion-pipeline)
   - [engines/quality_evaluator.py — Image Quality Scoring](#enginesquality_evaluatorpy--image-quality-scoring)
+  - [engines/iterative_generator.py — Iterative Image Editing](#enginesiterative_generatorpy--iterative-image-editing)
   - [engines/prompt_pipeline.py — Prompt Preprocessing Pipeline](#enginesprompt_pipelinepy--prompt-preprocessing-pipeline)
   - [engines/adaptive_sampler.py — Feedback-Driven Regeneration](#enginesadaptive_samplerpy--feedback-driven-regeneration)
   - [orchestrator/orchestrator.py — Job Queue & GPU Mutex](#orchestratororchestratopy--job-queue--gpu-mutex)
@@ -53,7 +54,9 @@ A complete reference of every implemented function, method, and component in the
 | `GenerateRequest` | Pydantic Model | Validates incoming generation requests (`prompt`, optional `seed`, optional `negative_prompt`). |
 | `GenerateResponse` | Pydantic Model | Returns the `job_id` of a submitted generation job. |
 | `JobStatusResponse` | Pydantic Model | Returns job status fields: `job_id`, `status`, `attempts`, `best_score`, `error`. |
-| `create_app(model_manager, quality_evaluator, prompt_pipeline, quality_threshold, use_memory)` | Factory Function | Builds and configures the FastAPI application. Sets up CORS, selects MongoDB or in-memory stores, initialises the user store, creates the `AdaptiveSampler` (with optional `PromptPipeline`) and `Orchestrator`, registers all route handlers, and wires up startup/shutdown lifecycle events. |
+| `EditRequest` | Pydantic Model | Validates edit requests: `session_id`, `edit_instruction`, `strength` (0–1, default 0.35). |
+| `EditResponse` | Pydantic Model | Returns `session_id` and `iteration` number after a session create/edit. |
+| `create_app(model_manager, quality_evaluator, prompt_pipeline, quality_threshold, use_memory)` | Factory Function | Builds and configures the FastAPI application. Sets up CORS, selects MongoDB or in-memory stores, initialises the user store, creates the `AdaptiveSampler`, `IterativeGenerator`, and `Orchestrator`, registers all route handlers, and wires up startup/shutdown lifecycle events. |
 | `_execute_job(job)` | Inner Function | Blocking callback passed to the orchestrator. Runs the adaptive sampler, persists each generated image via the artifact store, saves attempt metadata, and updates the `Job` model with results. |
 | `POST /generate` | Route | Accepts a `GenerateRequest`, creates a `Job`, submits it to the orchestrator, and schedules execution as a FastAPI background task. Returns the `job_id`. Requires JWT auth. Returns 503 if no GPU model is loaded. |
 | `GET /jobs` | Route | Returns a list of all submitted jobs (as dicts) from the orchestrator. |
@@ -61,6 +64,10 @@ A complete reference of every implemented function, method, and component in the
 | `GET /artifacts/{artifact_id}` | Route | Serves a stored PNG image by its artifact ID. Returns 404 if not found. |
 | `GET /jobs/{job_id}/image` | Route | Returns the best generated image for a completed job as a PNG response. Returns 404 if no image is found. |
 | `GET /artifacts/{artifact_id}/meta` | Route | Returns the attempt metadata document for a given artifact/job ID. Returns 404 if not found. |
+| `POST /generate-session` | Route | Creates a new iterative editing session. Generates the initial image via `IterativeGenerator.generate_initial()` in a background task. Returns the `session_id` and iteration 0. Requires JWT auth. |
+| `POST /edit` | Route | Applies an edit to the latest image in a session via `IterativeGenerator.edit_image()`. Accepts `session_id`, `edit_instruction`, and `strength`. Runs img2img in a background task. Returns the new iteration number. Requires JWT auth. |
+| `GET /sessions/{session_id}` | Route | Returns the full edit session object with all iterations. Requires JWT auth. |
+| `GET /sessions/{session_id}/image/{iteration}` | Route | Returns the image for a specific iteration in a session as PNG. |
 | `_startup()` | Lifecycle Event | (MongoDB mode) Pings MongoDB and creates required indexes on app startup. |
 | `_shutdown()` | Lifecycle Event | (MongoDB mode) Gracefully closes MongoDB clients on app shutdown. |
 
@@ -72,6 +79,8 @@ A complete reference of every implemented function, method, and component in the
 |--------|------|-------------|
 | `JobState` | Enum | Defines job lifecycle states: `PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `CANCELLED`. |
 | `AttemptRecord` | Dataclass | Stores metadata for a single generation attempt: `attempt_number`, `seed`, `steps`, `guidance_scale`, `width`, `height`, `quality_score`, `generation_time`, `image_key`. |
+| `Iteration` | Dataclass | One frame in an iterative editing session: `iteration` number, `prompt`, `edit_instruction`, `artifact_id`, `created_at`. Has `to_dict()` for serialisation. |
+| `EditSession` | Dataclass | Tracks an iterative editing session: `session_id`, `original_prompt`, list of `Iteration`s, `created_at`. Provides `add_iteration()`, `latest_iteration` property, and `to_dict()`. |
 | `Job` | Dataclass | Represents a full generation job with prompt, parameters, lifecycle state, and list of attempts. |
 | `Job.mark_running()` | Method | Transitions job state to `RUNNING`. |
 | `Job.mark_completed(best_attempt)` | Method | Transitions job state to `COMPLETED`, records the best attempt index and completion timestamp. |
@@ -92,7 +101,8 @@ A complete reference of every implemented function, method, and component in the
 | `ModelManager.load()` | Method | Downloads and loads the Stable Diffusion 1.5 pipeline in float16, moves it to GPU, disables the safety checker, and enables memory optimisations (attention slicing, VAE slicing, xformers if available). No-op if already loaded. |
 | `ModelManager.is_loaded` | Property | Returns `True` if the pipeline has been loaded. |
 | `ModelManager.device` | Property | Exposes the device string (e.g. `"cuda"`) for GPU cleanup. |
-| `ModelManager.generate(prompt, steps, guidance_scale, seed, width, height, negative_prompt)` | Method | Runs a single Stable Diffusion inference pass with the given parameters and returns the output as a `PIL.Image`. Handles CUDA OOM errors by clearing the cache and re-raising. Generates a random seed if none is provided. |
+| `ModelManager.generate(prompt, steps, guidance_scale, seed, width, height, negative_prompt)` | Method | Runs a single txt2img Stable Diffusion inference pass with the given parameters and returns the output as a `PIL.Image`. Handles CUDA OOM errors by clearing the cache and re-raising. Generates a random seed if none is provided. |
+| `ModelManager.img2img(prompt, image, strength, steps, guidance_scale, seed, negative_prompt)` | Method | Runs img2img on a source image with the given prompt and denoising strength. Shares weights with the txt2img pipeline. Handles CUDA OOM. Defaults: strength=0.35, steps=30, CFG=7.0. |
 
 ---
 
@@ -103,14 +113,20 @@ A complete reference of every implemented function, method, and component in the
 | `QualityEvaluator.__init__(w_clip, w_face, w_sharpness, device)` | Constructor | Stores scoring weights and device config. Defaults: 50% CLIP, 0% face, 50% sharpness. |
 | `QualityEvaluator._resolve_device()` | Method | Selects CUDA if available; raises `RuntimeError` otherwise. |
 | `QualityEvaluator.load()` | Method | Downloads and loads the CLIP ViT-B/32 model and processor from HuggingFace. Puts the model in eval mode on GPU. No-op if already loaded. Gracefully falls back to sharpness-only scoring (sets `w_clip=0`) if CLIP cannot be loaded (e.g. offline with no local cache). |
-| `QualityEvaluator.load_llava()` | Method | Downloads and loads the LLaVA 1.5-7B model in 4-bit quantisation via `bitsandbytes`. Uses `device_map="auto"` and float16 compute. No-op if already loaded. Gracefully falls back if model cannot be loaded. |
-| `QualityEvaluator.llava_available` | Property | Returns `True` if the LLaVA model and processor are loaded and ready. |
 | `QualityEvaluator.clip_score(prompt, image)` | Method | Extracts image and text embeddings via CLIP's `vision_model`/`text_model` + projection layers, L2-normalises both, computes true cosine similarity (dot product of unit vectors), and remaps from [-1, 1] to [0, 1]. Returns 0.0 if CLIP is not loaded. |
-| `QualityEvaluator.describe_image(image)` | Method | Uses LLaVA to generate a detailed natural-language description of the image (subject, style, colours, lighting, composition). Returns empty string if LLaVA is not loaded. |
-| `QualityEvaluator.prompt_alignment_score(prompt, image)` | Method | Asks LLaVA to rate how well the image matches the original prompt on a 1–10 scale. Returns `(score, description)` where score is normalised to [0, 1]. Returns `(0.0, "")` if LLaVA is not loaded. |
-| `QualityEvaluator._parse_rating(text)` | Static Method | Extracts a 1-10 numeric rating from LLaVA's text response using regex. Maps 1→0.0, 10→1.0. Defaults to 0.5 if parsing fails. |
 | `QualityEvaluator.sharpness_score(image)` | Static Method | Converts the image to grayscale, computes the Laplacian variance, and normalises it to [0, 1] (capped at variance / 1000). |
 | `QualityEvaluator.evaluate(prompt, image)` | Method | Computes the weighted combined score: `(w_clip * clip + w_face * face + w_sharpness * sharpness) / total_weight`, clamped to [0, 1]. |
+
+---
+
+### `engines/iterative_generator.py` — Iterative Image Editing
+
+| Symbol | Type | What It Does |
+|--------|------|-------------|
+| `IterativeGenerator.__init__(model_manager)` | Constructor | Stores reference to the `ModelManager`. |
+| `IterativeGenerator.generate_initial(prompt, seed, negative_prompt)` | Method | Creates the first image in an editing session via txt2img (512×512, 30 steps, CFG 7.5). |
+| `IterativeGenerator.edit_image(image, original_prompt, edit_instruction, strength, seed, negative_prompt)` | Method | Applies an edit to an existing image via img2img. Merges the edit instruction into the base prompt using `prompt_update()`, then runs img2img with the specified strength (default 0.35). |
+| `IterativeGenerator.prompt_update(original_prompt, edit_instruction)` | Static Method | Merges an edit instruction into the original prompt by appending it as a comma-separated refinement, preserving the base scene description. |
 
 ---
 
@@ -134,10 +150,10 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 
 | Symbol | Type | What It Does |
 |--------|------|-------------|
-| `SamplingResult` | Dataclass | Holds the final output of an adaptive loop: `best_image`, `best_attempt` index, list of `AttemptRecord`s, all generated images, per-attempt `llava_scores` [0, 1], and per-attempt `llava_descriptions`. |
+| `SamplingResult` | Dataclass | Holds the final output of an adaptive loop: `best_image`, `best_attempt` index, list of `AttemptRecord`s, and all generated images. |
 | `_clear_cuda_cache()` | Module Function | Calls `torch.cuda.empty_cache()` if CUDA is available; silently skips if torch is not installed. |
 | `AdaptiveSampler.__init__(model_manager, quality_evaluator, quality_threshold, max_attempts, prompt_pipeline)` | Constructor | Stores references to the `ModelManager`, `QualityEvaluator`, and optional `PromptPipeline`, along with the quality threshold (default 0.80) and max attempts (default 10). |
-| `AdaptiveSampler.run(prompt, seed, steps, guidance_scale, width, height, negative_prompt)` | Method | Saves the original user prompt for LLaVA comparison, then if a `PromptPipeline` is attached, preprocesses the prompt through spelling correction, grammar correction, and diffusion-friendly enhancement before generation. Merges the pipeline's negative prompt with any user-supplied one. Then executes the adaptive sampling loop: generates an image, evaluates quality via CLIP+sharpness (drives steps/CFG adjustments), evaluates prompt alignment via LLaVA (logged per attempt for future prompt rewriting), and if below threshold, adjusts parameters (increases steps by 10, multiplies CFG by 1.1, changes seed, strengthens negative prompt) and retries up to `max_attempts` (10) times. Handles CUDA OOM gracefully by reducing steps. Clears GPU memory after each attempt. Returns a `SamplingResult` with the best image, all attempt records, LLaVA scores, and LLaVA descriptions. |
+| `AdaptiveSampler.run(prompt, seed, steps, guidance_scale, width, height, negative_prompt)` | Method | If a `PromptPipeline` is attached, preprocesses the prompt through spelling correction, grammar correction, and diffusion-friendly enhancement before generation. Merges the pipeline's negative prompt with any user-supplied one. Then executes the adaptive sampling loop: generates an image, evaluates quality via CLIP+sharpness, and if below threshold, adjusts parameters (increases steps by 10, multiplies CFG by 1.1, changes seed, strengthens negative prompt) and retries up to `max_attempts` (10) times. Handles CUDA OOM gracefully by reducing steps. Clears GPU memory after each attempt. Returns a `SamplingResult` with the best image and all attempt records. |
 
 ---
 
@@ -291,6 +307,10 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | `artifactUrl(artifactId)` | Function | Returns the full URL to download an artifact image by ID. |
 | `jobImageUrl(jobId)` | Function | Returns the full URL to download the best image for a job. |
 | `fetchJobImage(jobId)` | Function | Fetches the best image for a job as a blob with auth headers, creates a blob URL, and returns it. Throws on failure. |
+| `createEditSession(prompt, seed, negativePrompt)` | Function | Sends `POST /generate-session` to create a new iterative editing session; returns `{ session_id, iteration }`. |
+| `editImage(sessionId, editInstruction, strength)` | Function | Sends `POST /edit` with the edit instruction and strength; returns `{ session_id, iteration }`. |
+| `getSession(sessionId)` | Function | Sends `GET /sessions/{sessionId}`; returns the full session object with iterations. |
+| `fetchSessionImage(sessionId, iteration)` | Function | Fetches the image for a specific iteration as a blob URL with auth headers. |
 
 ---
 
@@ -364,9 +384,11 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | Symbol | Type | What It Does |
 |--------|------|-------------|
 | `StatusBadge({ status })` | Component | Renders a colour-coded pill badge for job status (`pending`, `running`, `completed`, `failed`, `cancelled`). |
-| `Generate()` | Component | Main image generation page. Provides a prompt form (prompt, negative prompt, seed), submits generation requests, polls for job status updates, fetches and displays the completed image, and shows a scrollable job history sidebar with stats (attempts, best score, status). |
+| `Generate()` | Component | Main image generation and editing page. Provides a prompt form (prompt, negative prompt, seed) with two actions: \"Generate\" (single job) and \"Generate & Edit Session\" (creates an iterative editing session). For jobs: submits generation requests, polls status, fetches/displays the completed image, shows a job history sidebar. For edit sessions: shows an iteration timeline with thumbnail previews, the selected iteration image, an edit instruction input with strength slider, and iteration stats. |
 | `refreshJobs()` | Inner Function | Fetches all jobs via `listJobs()` and updates the jobs state (newest first). |
 | `handleGenerate(e)` | Inner Function | Submits the prompt via `generateImage()`, fetches the initial job state, and sets it as the active job. Clears the prompt input on success. |
+| `handleGenerateSession(e)` | Inner Function | Creates a new iterative editing session via `createEditSession()`, sets the session ID, and resets iteration state. |
+| `handleEdit(e)` | Inner Function | Submits an edit instruction via `editImage()` to modify the latest iteration image. Clears the edit input on success. |
 | `bestArtifact(job)` | Inner Function | **Stub** — intended to resolve the best artifact key for a job. Currently returns `null`. (See [UNIMPLEMENTED.md](UNIMPLEMENTED.md)) |
 | `useEffect` (image fetch) | Effect | When the active job completes, fetches the best image as a blob URL via `fetchJobImage()` and manages cleanup of old blob URLs. |
 | `useEffect` (polling) | Effect | Polls `getJob()` every 2 seconds while a job is in progress. Stops polling and refreshes the job list when the job reaches a terminal state. |

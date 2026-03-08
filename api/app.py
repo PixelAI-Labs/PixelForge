@@ -16,12 +16,13 @@ from typing import Any, Dict, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from auth.dependencies import get_current_user
 from auth.router import init_user_store, router as auth_router
 from auth.store import UserStore
-from core.models import AttemptRecord, Job
+from core.models import AttemptRecord, EditSession, Iteration, Job
 from db.connection import (
     close_clients,
     ensure_indexes,
@@ -29,6 +30,7 @@ from db.connection import (
     ping_mongo,
 )
 from engines.adaptive_sampler import AdaptiveSampler
+from engines.iterative_generator import IterativeGenerator
 from engines.model_manager import ModelManager
 from engines.prompt_pipeline import PromptPipeline
 from engines.quality_evaluator import QualityEvaluator
@@ -56,6 +58,17 @@ class JobStatusResponse(BaseModel):
     attempts: int
     best_score: float
     error: Optional[str] = None
+
+
+class EditRequest(BaseModel):
+    session_id: str
+    edit_instruction: str
+    strength: float = Field(0.35, ge=0.0, le=1.0)
+
+
+class EditResponse(BaseModel):
+    session_id: str
+    iteration: int
 
 
 # ---- app factory ------------------------------------------------
@@ -120,6 +133,10 @@ def create_app(
         quality_threshold=quality_threshold,
         prompt_pipeline=pp,
     )
+    itergen = IterativeGenerator(mm)
+
+    # session_id -> EditSession (in-memory; production should persist)
+    edit_sessions: Dict[str, EditSession] = {}
 
     # ---- helpers ------------------------------------------------
 
@@ -219,5 +236,108 @@ def create_app(
         if meta is None:
             raise HTTPException(status_code=404, detail="Metadata not found")
         return meta
+
+    # ---- iterative editing routes --------------------------------
+
+    @app.post("/generate-session", response_model=EditResponse)
+    async def generate_session(
+        req: GenerateRequest,
+        background_tasks: BackgroundTasks,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> EditResponse:
+        """Create a new editing session with an initial image."""
+        if mm._pipe is None and mm._device is None:
+            raise HTTPException(status_code=503, detail="Model unavailable.")
+
+        session = EditSession(original_prompt=req.prompt)
+
+        def _run() -> None:
+            image = itergen.generate_initial(
+                prompt=req.prompt,
+                seed=req.seed,
+                negative_prompt=req.negative_prompt,
+            )
+            artifact_id = store.save_image(image, session.session_id, 0)
+            it = Iteration(
+                iteration=0,
+                prompt=req.prompt,
+                artifact_id=artifact_id,
+            )
+            session.add_iteration(it)
+
+        edit_sessions[session.session_id] = session
+        background_tasks.add_task(_run)
+        return EditResponse(session_id=session.session_id, iteration=0)
+
+    @app.post("/edit", response_model=EditResponse)
+    async def edit_image(
+        req: EditRequest,
+        background_tasks: BackgroundTasks,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> EditResponse:
+        """Apply an edit to the latest image in a session."""
+        session = edit_sessions.get(req.session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        latest = session.latest_iteration
+        if latest is None or latest.artifact_id is None:
+            raise HTTPException(status_code=409, detail="Session has no image yet")
+
+        next_iter = len(session.iterations)
+
+        def _run() -> None:
+            # Load previous image from store
+            prev_bytes = store.get_image_bytes(latest.artifact_id)
+            if prev_bytes is None:
+                logger.error("Previous image not found for session %s", req.session_id)
+                return
+
+            import io
+            prev_image = Image.open(io.BytesIO(prev_bytes)).convert("RGB")
+
+            result_image = itergen.edit_image(
+                image=prev_image,
+                original_prompt=latest.prompt,
+                edit_instruction=req.edit_instruction,
+                strength=req.strength,
+            )
+            merged_prompt = itergen.prompt_update(latest.prompt, req.edit_instruction)
+            artifact_id = store.save_image(result_image, session.session_id, next_iter)
+            it = Iteration(
+                iteration=next_iter,
+                prompt=merged_prompt,
+                edit_instruction=req.edit_instruction,
+                artifact_id=artifact_id,
+            )
+            session.add_iteration(it)
+
+        background_tasks.add_task(_run)
+        return EditResponse(session_id=req.session_id, iteration=next_iter)
+
+    @app.get("/sessions/{session_id}")
+    async def get_session(
+        session_id: str,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> Dict[str, Any]:
+        session = edit_sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return session.to_dict()
+
+    @app.get("/sessions/{session_id}/image/{iteration}")
+    async def get_session_image(
+        session_id: str,
+        iteration: int,
+    ) -> Response:
+        """Return the image for a specific iteration."""
+        session = edit_sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        for it in session.iterations:
+            if it.iteration == iteration and it.artifact_id:
+                data = store.get_image_bytes(it.artifact_id)
+                if data:
+                    return Response(content=data, media_type="image/png")
+        raise HTTPException(status_code=404, detail="Image not found for this iteration")
 
     return app

@@ -1,4 +1,4 @@
-"""ModelManager — loads Stable Diffusion 1.5 and exposes a generate() interface.
+"""ModelManager — loads Stable Diffusion 1.5 and exposes generate() + img2img() interfaces.
 
 Constraints (from DESIGN.md / DRD):
 * dtype = torch.float16 on CUDA (GPU-only, no CPU fallback)
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 from typing import TYPE_CHECKING, Any, Optional
 
 from PIL import Image
@@ -43,6 +44,8 @@ class ModelManager:
         self._explicit_device = device  # None means "resolve later"
         self._device: Optional[str] = device
         self._pipe: Any = None  # StableDiffusionPipeline at runtime
+        self._img2img_pipe: Any = None  # StableDiffusionImg2ImgPipeline at runtime
+        self._lock = threading.Lock()  # serialize inference (scheduler is not thread-safe)
 
         if auto_load:
             self._resolve_device()
@@ -70,7 +73,7 @@ class ModelManager:
         self._resolve_device()
 
         import torch as _torch
-        from diffusers import StableDiffusionPipeline
+        from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
 
         logger.info("Loading model %s on %s …", self._model_id, self._device)
 
@@ -100,6 +103,18 @@ class ModelManager:
             self._device,
             dtype,
         )
+
+        # Build img2img pipeline sharing the same components
+        self._img2img_pipe = StableDiffusionImg2ImgPipeline(
+            vae=self._pipe.vae,
+            text_encoder=self._pipe.text_encoder,
+            tokenizer=self._pipe.tokenizer,
+            unet=self._pipe.unet,
+            scheduler=self._pipe.scheduler,
+            safety_checker=None,
+            feature_extractor=self._pipe.feature_extractor,
+        )
+        logger.info("Img2Img pipeline ready (shared weights).")
 
     @property
     def is_loaded(self) -> bool:
@@ -153,29 +168,97 @@ class ModelManager:
 
         generator = _torch.Generator(device=self._device).manual_seed(seed)
 
-        try:
-            result = self._pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt or None,
-                num_inference_steps=steps,
-                guidance_scale=guidance_scale,
-                width=width,
-                height=height,
-                generator=generator,
-            )
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower():
-                logger.error(
-                    "CUDA OOM during generation (steps=%d, %dx%d). "
-                    "Clearing cache and re-raising.",
-                    steps,
-                    width,
-                    height,
+        with self._lock:
+            try:
+                result = self._pipe(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt or None,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance_scale,
+                    width=width,
+                    height=height,
+                    generator=generator,
                 )
-                if self._device == "cuda":
-                    _torch.cuda.empty_cache()
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    logger.error(
+                        "CUDA OOM during generation (steps=%d, %dx%d). "
+                        "Clearing cache and re-raising.",
+                        steps,
+                        width,
+                        height,
+                    )
+                    if self._device == "cuda":
+                        _torch.cuda.empty_cache()
+                    raise
                 raise
-            raise
 
         image: Image.Image = result.images[0]
         return image
+
+    def img2img(
+        self,
+        prompt: str,
+        image: Image.Image,
+        strength: float = 0.35,
+        steps: int = 30,
+        guidance_scale: float = 7.0,
+        seed: Optional[int] = None,
+        negative_prompt: str = "",
+    ) -> Image.Image:
+        """Run img2img on *image* with the given prompt.
+
+        Parameters
+        ----------
+        prompt : str
+            Text prompt describing the desired output.
+        image : PIL.Image.Image
+            The source image to transform.
+        strength : float
+            Denoising strength (0 = no change, 1 = full regeneration).
+        steps : int
+            Number of denoising steps.
+        guidance_scale : float
+            Classifier-free guidance scale.
+        seed : int | None
+            Reproducibility seed.
+        negative_prompt : str
+            Negative prompt.
+
+        Returns
+        -------
+        PIL.Image.Image
+        """
+        if self._img2img_pipe is None:
+            raise RuntimeError("Model not loaded — call load() first.")
+
+        import torch as _torch
+
+        if seed is None:
+            seed = random.randint(0, 2**32 - 1)
+
+        generator = _torch.Generator(device=self._device).manual_seed(seed)
+
+        # Ensure image is RGB and matches expected size
+        image = image.convert("RGB").resize((512, 512))
+
+        with self._lock:
+            try:
+                result = self._img2img_pipe(
+                    prompt=prompt,
+                    image=image,
+                    strength=strength,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance_scale,
+                    negative_prompt=negative_prompt or None,
+                    generator=generator,
+                )
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    logger.error("CUDA OOM during img2img.")
+                    if self._device == "cuda":
+                        _torch.cuda.empty_cache()
+                    raise
+                raise
+
+        return result.images[0]

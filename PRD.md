@@ -87,12 +87,11 @@ There is a need for a system that:
 ### 6.2 Quality Evaluation
 The system must compute:
 
-- CLIP similarity between prompt and image
-- Face detection confidence (when relevant)
+- CLIP similarity between prompt and image (true cosine, L2-normalised embeddings)
+- Face detection confidence (when relevant — placeholder, not yet active)
 - Image sharpness via Laplacian variance
-- Optional artifact heuristics
 
-All metrics normalized into a 0–1 quality score.
+All metrics normalized into a 0–1 quality score. Default quality threshold: **0.80**.
 
 ### 6.3 Adaptive Regeneration
 
@@ -103,7 +102,7 @@ If quality score < threshold:
 - Modify negative prompt
 - Change seed
 - Slightly adjust resolution if needed
-- Regenerate (max 3 attempts)
+- Regenerate (max 10 attempts)
 
 Select best-scoring image.
 
@@ -137,8 +136,8 @@ Store:
 
 ### Performance
 - Initial generation under 15 seconds (GPU)
-- Max 3 regeneration attempts
-- Quality scoring overhead < 200ms
+- Max 10 regeneration attempts
+- Quality scoring overhead < 200ms (CLIP + sharpness)
 
 ### Reliability
 - Graceful fallback if ML dependencies unavailable
@@ -177,11 +176,13 @@ Store:
 
 ### Included
 - Stable Diffusion inference
-- CLIP alignment scoring
+- CLIP alignment scoring (true cosine similarity)
+- Iterative image editing via img2img sessions
 - Sharpness detection
-- Adaptive regeneration (max 2 retries)
+- Adaptive regeneration (max 10 attempts, threshold 0.80)
+- Prompt preprocessing pipeline (SymSpell + Flan-T5 + enhancement)
 - Metadata logging
-- Basic frontend interface
+- React + Vite frontend with auth
 
 ### Excluded
 - Model fine-tuning
