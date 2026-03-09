@@ -1,6 +1,8 @@
-# Implemented Functions & Components
+# PixelForge — Implemented Functions & Components
 
-A complete reference of every implemented function, method, and component in the PixelForge codebase, grouped by module.
+A complete reference of every implemented function, method, and component in the PixelForge codebase, grouped by module.  
+For unimplemented stubs and deferred features, see [UNIMPLEMENTED.md](UNIMPLEMENTED.md).  
+For the end-to-end system workflow, see [WORKFLOW.md](WORKFLOW.md).
 
 ---
 
@@ -53,10 +55,10 @@ A complete reference of every implemented function, method, and component in the
 |--------|------|-------------|
 | `GenerateRequest` | Pydantic Model | Validates incoming generation requests (`prompt`, optional `seed`, optional `negative_prompt`). |
 | `GenerateResponse` | Pydantic Model | Returns the `job_id` of a submitted generation job. |
-| `JobStatusResponse` | Pydantic Model | Returns job status fields: `job_id`, `status`, `attempts`, `best_score`, `error`. |
+| `JobStatusResponse` | Pydantic Model | Returns job status fields: `job_id`, `state`, `prompt`, `attempts`, `best_score`, `error`. |
 | `EditRequest` | Pydantic Model | Validates edit requests: `session_id`, `edit_instruction`, `strength` (0–1, default 0.35). |
 | `EditResponse` | Pydantic Model | Returns `session_id` and `iteration` number after a session create/edit. |
-| `create_app(model_manager, quality_evaluator, prompt_pipeline, quality_threshold, use_memory)` | Factory Function | Builds and configures the FastAPI application. Sets up CORS, selects MongoDB or in-memory stores, initialises the user store, creates the `AdaptiveSampler`, `IterativeGenerator`, and `Orchestrator`, registers all route handlers, and wires up startup/shutdown lifecycle events. |
+| `create_app(model_manager, quality_evaluator, prompt_pipeline, quality_threshold, use_memory)` | Factory Function | Builds and configures the FastAPI application. Sets up CORS, selects MongoDB or in-memory stores, initialises the user store, creates the `AdaptiveSampler`, `IterativeGenerator` (with `prompt_pipeline`), and `Orchestrator`, registers all route handlers, and wires up startup/shutdown lifecycle events. |
 | `_execute_job(job)` | Inner Function | Blocking callback passed to the orchestrator. Runs the adaptive sampler, persists each generated image via the artifact store, saves attempt metadata, and updates the `Job` model with results. |
 | `POST /generate` | Route | Accepts a `GenerateRequest`, creates a `Job`, submits it to the orchestrator, and schedules execution as a FastAPI background task. Returns the `job_id`. Requires JWT auth. Returns 503 if no GPU model is loaded. |
 | `GET /jobs` | Route | Returns a list of all submitted jobs (as dicts) from the orchestrator. |
@@ -64,12 +66,16 @@ A complete reference of every implemented function, method, and component in the
 | `GET /artifacts/{artifact_id}` | Route | Serves a stored PNG image by its artifact ID. Returns 404 if not found. |
 | `GET /jobs/{job_id}/image` | Route | Returns the best generated image for a completed job as a PNG response. Returns 404 if no image is found. |
 | `GET /artifacts/{artifact_id}/meta` | Route | Returns the attempt metadata document for a given artifact/job ID. Returns 404 if not found. |
+| `_persisted_session_jobs` | Module Variable | A `set[str]` tracking session IDs that have already been promoted to the gallery. Prevents duplicate Job records if a session is ended more than once or on shutdown. |
+| `_persist_session_result(session)` | Inner Function | Promotes the final iteration of an `EditSession` to the gallery. Creates a `Job` record with the session's last image, fabricates an `AttemptRecord`, saves metadata via the artifact store, and registers the job with the orchestrator. Skips if the session has no iterations or was already persisted (checked via `_persisted_session_jobs`). |
 | `POST /generate-session` | Route | Creates a new iterative editing session. Generates the initial image via `IterativeGenerator.generate_initial()` in a background task. Returns the `session_id` and iteration 0. Requires JWT auth. |
 | `POST /edit` | Route | Applies an edit to the latest image in a session via `IterativeGenerator.edit_image()`. Accepts `session_id`, `edit_instruction`, and `strength`. Runs img2img in a background task. Returns the new iteration number. Requires JWT auth. |
+| `GET /sessions` | Route | Returns a summary list of all active edit sessions. Each entry includes `session_id`, `original_prompt`, `iteration_count`, and `created_at`. Requires JWT auth. |
 | `GET /sessions/{session_id}` | Route | Returns the full edit session object with all iterations. Requires JWT auth. |
 | `GET /sessions/{session_id}/image/{iteration}` | Route | Returns the image for a specific iteration in a session as PNG. |
-| `_startup()` | Lifecycle Event | (MongoDB mode) Pings MongoDB and creates required indexes on app startup. |
-| `_shutdown()` | Lifecycle Event | (MongoDB mode) Gracefully closes MongoDB clients on app shutdown. |
+| `DELETE /sessions/{session_id}` | Route | Ends (closes) an editing session. Promotes the session's final iteration to the gallery via `_persist_session_result()`, saves and then deletes the session from the store. Returns `{ status, session_id }`. Requires JWT auth. |
+| `_startup()` | Lifecycle Event | (MongoDB mode) Pings MongoDB, creates required indexes, and restores previously persisted edit sessions from the `edit_sessions` MongoDB collection back into the in-memory `edit_sessions` dict. Logs the count of restored sessions. |
+| `_shutdown()` | Lifecycle Event | (MongoDB mode) Iterates over all active edit sessions, promotes each to the gallery via `_persist_session_result()`, flushes each to MongoDB via `store.save_session()`, then closes MongoDB clients. |
 
 ---
 
@@ -123,9 +129,9 @@ A complete reference of every implemented function, method, and component in the
 
 | Symbol | Type | What It Does |
 |--------|------|-------------|
-| `IterativeGenerator.__init__(model_manager)` | Constructor | Stores reference to the `ModelManager`. |
-| `IterativeGenerator.generate_initial(prompt, seed, negative_prompt)` | Method | Creates the first image in an editing session via txt2img (512×512, 30 steps, CFG 7.5). |
-| `IterativeGenerator.edit_image(image, original_prompt, edit_instruction, strength, seed, negative_prompt)` | Method | Applies an edit to an existing image via img2img. Merges the edit instruction into the base prompt using `prompt_update()`, then runs img2img with the specified strength (default 0.35). |
+| `IterativeGenerator.__init__(model_manager, prompt_pipeline)` | Constructor | Stores references to the `ModelManager` and an optional `PromptPipeline`. |
+| `IterativeGenerator.generate_initial(prompt, seed, negative_prompt)` | Method | Creates the first image in an editing session via txt2img (512×512, 30 steps, CFG 7.5). If a `PromptPipeline` is attached, preprocesses the prompt through spelling/grammar/enhancement stages and merges the pipeline's negative prompt before generation. |
+| `IterativeGenerator.edit_image(image, original_prompt, edit_instruction, strength, seed, negative_prompt)` | Method | Applies an edit to an existing image via img2img. If a `PromptPipeline` is attached, uses `pipeline.merge_edit()` to cleanly combine the base prompt and edit instruction, then processes through the full pipeline. Falls back to `prompt_update()` when no pipeline is available. Runs img2img with the specified strength (default 0.35). |
 | `IterativeGenerator.prompt_update(original_prompt, edit_instruction)` | Static Method | Merges an edit instruction into the original prompt by appending it as a comma-separated refinement, preserving the base scene description. |
 
 ---
@@ -143,6 +149,7 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | `PromptPipeline._ensure_grammar_model()` | Method | Thread-safe lazy loader for the Flan-T5-small model and tokenizer from HuggingFace. Loads onto the configured device in eval mode exactly once. |
 | `PromptPipeline._correct_grammar(text)` | Method | **Stage 2** — Sends the prompt to Flan-T5-small with the instruction `"Correct the grammar of this sentence: <text>"`. Uses deterministic generation (no sampling, max 128 new tokens). Returns the corrected text. |
 | `PromptPipeline._enhance(text)` | Static Method | **Stage 3** — Rule-based enhancement. Prefixes short prompts (<8 words) with `"Highly detailed image of"`. Appends quality keywords (`cinematic lighting, ultra sharp focus, 4k resolution`) if none are already present. Returns the enhanced prompt and a default negative prompt (`"blurry, distorted, low resolution, extra limbs, malformed anatomy"`). |
+| `PromptPipeline.merge_edit(base_prompt, edit_instruction)` | Method | Merges an edit instruction into a base prompt for iterative editing. Strips imperative prefixes (`"add "`, `"make it "`, `"make the "`, `"change to "`, `"change the "`) from the edit, then appends the cleaned edit as a comma-separated refinement to the base prompt. Logs the transformation. |
 
 ---
 
@@ -187,6 +194,9 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | `get_best_image_bytes(job_id)` | Method | Looks up the metadata for a job, finds the selected attempt's image, and returns its bytes. Falls back to the last stored artifact for the job. |
 | `save_metadata(job_id, prompt, attempts, selected)` | Method | Stores a dict with the prompt, per-attempt details (seed, steps, CFG, score, time, image key), and the selected attempt index. |
 | `get_metadata(job_id)` | Method | Returns the metadata dict for a job, or `None`. |
+| `save_session(session)` | Method | Stores an `EditSession` (serialised via `to_dict()`) in the in-memory sessions dict. |
+| `load_sessions()` | Method | Returns all stored sessions as a `Dict[str, EditSession]`, deserialised via `_session_from_dict()`. |
+| `delete_session(session_id)` | Method | Removes a session from the in-memory sessions dict. |
 
 #### `MongoArtifactStore` (production)
 
@@ -198,6 +208,9 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | `get_best_image_bytes(job_id)` | Method | Queries `artifact_meta` for the selected attempt, resolves its `image_key`, and returns the corresponding image bytes. Falls back to the most recent artifact for the job. |
 | `save_metadata(job_id, prompt, attempts, selected)` | Method | Upserts a metadata document into `artifact_meta` with prompt, per-attempt details, and the selected attempt index. |
 | `get_metadata(job_id)` | Method | Queries `artifact_meta` for the job and returns the document (excluding `_id`), or `None`. |
+| `save_session(session)` | Method | Serialises an `EditSession` via `to_dict()` and upserts it into the `edit_sessions` MongoDB collection (keyed by `session_id`). |
+| `load_sessions()` | Method | Queries all documents from the `edit_sessions` collection and returns them as a `Dict[str, EditSession]`, deserialised via `_session_from_dict()`. |
+| `delete_session(session_id)` | Method | Deletes the session document with the given `session_id` from the `edit_sessions` collection. |
 
 ---
 
@@ -311,6 +324,8 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | `editImage(sessionId, editInstruction, strength)` | Function | Sends `POST /edit` with the edit instruction and strength; returns `{ session_id, iteration }`. |
 | `getSession(sessionId)` | Function | Sends `GET /sessions/{sessionId}`; returns the full session object with iterations. |
 | `fetchSessionImage(sessionId, iteration)` | Function | Fetches the image for a specific iteration as a blob URL with auth headers. |
+| `listSessions()` | Function | Sends `GET /sessions`; returns a summary list of all active edit sessions. |
+| `endSession(sessionId)` | Function | Sends `DELETE /sessions/{sessionId}` to end an editing session and promote it to the gallery. |
 
 ---
 
@@ -384,12 +399,18 @@ A three-stage pipeline that preprocesses user prompts before image generation: s
 | Symbol | Type | What It Does |
 |--------|------|-------------|
 | `StatusBadge({ status })` | Component | Renders a colour-coded pill badge for job status (`pending`, `running`, `completed`, `failed`, `cancelled`). |
-| `Generate()` | Component | Main image generation and editing page. Provides a prompt form (prompt, negative prompt, seed) with two actions: \"Generate\" (single job) and \"Generate & Edit Session\" (creates an iterative editing session). For jobs: submits generation requests, polls status, fetches/displays the completed image, shows a job history sidebar. For edit sessions: shows an iteration timeline with thumbnail previews, the selected iteration image, an edit instruction input with strength slider, and iteration stats. |
+| `Generate()` | Component | Main image generation and editing page. Provides a prompt form (prompt, negative prompt, seed) with two actions: "Generate" (single job) and "Generate & Edit Session" (creates an iterative editing session). For jobs: submits generation requests, polls status, fetches/displays the completed image, shows a job history sidebar with thumbnail previews. For edit sessions: shows an iteration timeline with thumbnail previews, the selected iteration image, an edit instruction input with strength slider, iteration stats, and an "End Session" button that promotes the result to the gallery. The history sidebar lists active edit sessions (with a purple badge) above completed jobs. |
 | `refreshJobs()` | Inner Function | Fetches all jobs via `listJobs()` and updates the jobs state (newest first). |
 | `handleGenerate(e)` | Inner Function | Submits the prompt via `generateImage()`, fetches the initial job state, and sets it as the active job. Clears the prompt input on success. |
-| `handleGenerateSession(e)` | Inner Function | Creates a new iterative editing session via `createEditSession()`, sets the session ID, and resets iteration state. |
+| `handleGenerateSession(e)` | Inner Function | Creates a new iterative editing session via `createEditSession()`, sets the session ID, resets iteration state, and refreshes the sessions list. |
 | `handleEdit(e)` | Inner Function | Submits an edit instruction via `editImage()` to modify the latest iteration image. Clears the edit input on success. |
-| `bestArtifact(job)` | Inner Function | **Stub** — intended to resolve the best artifact key for a job. Currently returns `null`. (See [UNIMPLEMENTED.md](UNIMPLEMENTED.md)) |
+| `bestArtifact(job)` | Inner Function | **Stub** — intended to resolve the best artifact key for a job. Currently returns `null`. Superseded by `fetchJobImage()` + `jobThumbs` state for history thumbnails. (See [UNIMPLEMENTED.md](UNIMPLEMENTED.md)) |
+| `jobThumbs` | State | `useState({})` — cache of thumbnail blob URLs for completed jobs in the history sidebar, keyed by `job_id`. Populated lazily via `fetchJobImage()`. |
+| `sessions` | State | `useState([])` — list of active edit sessions fetched from the backend. Displayed in the history sidebar above jobs. |
+| `refreshSessions()` | Inner Function | Fetches all active edit sessions via `listSessions()` and updates the `sessions` state. |
+| `handleResumeSession(sid)` | Inner Function | Clears the current session state (poll interval, fetched iterations, images), revokes old blob URLs, and loads a different session by setting the `sessionId`. |
+| `handleEndSession()` | Inner Function | Ends the current editing session via `endSession()`, clears all session state, and refreshes both the sessions and jobs lists. |
 | `useEffect` (image fetch) | Effect | When the active job completes, fetches the best image as a blob URL via `fetchJobImage()` and manages cleanup of old blob URLs. |
 | `useEffect` (polling) | Effect | Polls `getJob()` every 2 seconds while a job is in progress. Stops polling and refreshes the job list when the job reaches a terminal state. |
-| `useEffect` (mount) | Effect | Calls `refreshJobs()` on component mount to load the job history. |
+| `useEffect` (mount) | Effect | Calls `refreshJobs()` and `refreshSessions()` on component mount to load the job history and active sessions. |
+| `useEffect` (job thumbnails) | Effect | For each completed job in the history list, lazily fetches its best image via `fetchJobImage()` and stores the blob URL in `jobThumbs` for thumbnail display. Uses `fetchedThumbsRef` to avoid redundant fetches. |

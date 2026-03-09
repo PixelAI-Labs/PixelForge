@@ -1,6 +1,9 @@
-# PixelForge — System Workflow
+# PixelForge — System Workflow & Architecture
 
-> End-to-end description of how a user prompt becomes a generated image.
+> End-to-end description of how a user prompt becomes a generated image, including architecture decisions, design principles, and deployment topology.
+
+For a complete function-level reference, see [IMPLEMENTED.md](IMPLEMENTED.md).  
+For unimplemented stubs and future roadmap, see [UNIMPLEMENTED.md](UNIMPLEMENTED.md).
 
 ---
 
@@ -24,6 +27,9 @@
 8. [Component Interaction Map](#8-component-interaction-map)
 9. [Error Handling](#9-error-handling)
 10. [Deployment Topology](#10-deployment-topology)
+11. [Architecture Decisions](#11-architecture-decisions)
+12. [Design Principles](#12-design-principles)
+13. [Technology Stack](#13-technology-stack)
 
 ---
 
@@ -266,16 +272,18 @@ After the adaptive loop completes, `_execute_job()` in `app.py`:
 
 ## 5. Iterative Editing Flow
 
-The iterative editing system lets users refine images through successive img2img edits.
+The iterative editing system lets users refine images through successive img2img edits. Sessions can be listed, resumed, ended (promoting the result to the gallery), and are persisted to MongoDB.
 
-**File:** `engines/iterative_generator.py`, `api/app.py`
+**Files:** `engines/iterative_generator.py`, `engines/prompt_pipeline.py`, `api/app.py`
 
 ```
 User: "A castle on a hill"
          │
          ▼  POST /generate-session
    IterativeGenerator.generate_initial()
-         │  txt2img (512×512, 30 steps)
+     1. PromptPipeline.process(prompt)         ← spelling + grammar + enhance
+     2. txt2img(enhanced_prompt, 512×512, 30 steps)
+         │
          ▼
    Iteration 0: [castle image]  ← stored in ArtifactStore
          │
@@ -283,9 +291,10 @@ User: "add neon lights"
          │
          ▼  POST /edit  (strength=0.35)
    IterativeGenerator.edit_image()
-     1. prompt_update("A castle on a hill", "add neon lights")
-        → "A castle on a hill, add neon lights"
-     2. img2img(prev_image, merged_prompt, strength=0.35)
+     1. PromptPipeline.merge_edit("A castle on a hill", "add neon lights")
+        → "A castle on a hill, neon lights"    ← strips imperative prefix
+     2. PromptPipeline.process(merged)          ← enhance merged prompt
+     3. img2img(prev_image, enhanced_prompt, strength=0.35)
          │
          ▼
    Iteration 1: [castle + neon]  ← stored in ArtifactStore
@@ -294,21 +303,45 @@ User: "make it nighttime"
          │
          ▼  POST /edit  (strength=0.35)
    Iteration 2: [castle + neon + night]
+         │
+User clicks "End Session"
+         │
+         ▼  DELETE /sessions/{session_id}
+   _persist_session_result(session)
+     1. Creates a Job record from the final iteration
+     2. Fabricates an AttemptRecord with quality_score=1.0
+     3. Saves image metadata via ArtifactStore
+     4. Registers job with Orchestrator → appears in gallery
+     5. Deduplication: skips if session_id already in _persisted_session_jobs
+         │
+         ▼
+   Session removed from active list, final image in gallery
 ```
 
 ### Session Lifecycle
 
-1. **Create session** (`POST /generate-session`): Generates initial image via txt2img, creates `EditSession` with `Iteration 0`
-2. **Edit** (`POST /edit`): Loads previous iteration image, merges edit instruction into prompt, runs img2img, creates new `Iteration`
-3. **View session** (`GET /sessions/{id}`): Returns all iterations with metadata
-4. **View iteration image** (`GET /sessions/{id}/image/{n}`): Returns the image for iteration *n*
+1. **Create session** (`POST /generate-session`): Generates initial image via txt2img (enhanced by PromptPipeline), creates `EditSession` with `Iteration 0`, persists session to MongoDB
+2. **Edit** (`POST /edit`): Loads previous iteration image, merges edit instruction via `PromptPipeline.merge_edit()`, processes through pipeline, runs img2img, creates new `Iteration`, persists to MongoDB
+3. **List sessions** (`GET /sessions`): Returns all active sessions with `session_id`, `original_prompt`, `iteration_count`, `created_at`
+4. **View session** (`GET /sessions/{id}`): Returns all iterations with metadata
+5. **View iteration image** (`GET /sessions/{id}/image/{n}`): Returns the image for iteration *n*
+6. **Resume session**: Frontend can switch to a different session via `handleResumeSession(sid)` — clears current state and loads the selected session
+7. **End session** (`DELETE /sessions/{id}`): Promotes final iteration to gallery, saves/deletes from MongoDB
+
+### Session Persistence
+
+- Sessions are saved to MongoDB (`edit_sessions` collection) after each operation
+- On startup (`_startup()`), previously persisted sessions are restored from MongoDB into memory
+- On shutdown (`_shutdown()`), all active sessions are promoted to gallery and flushed to MongoDB
 
 ### Frontend UI
 
 The Generate page shows:
+- **History sidebar**: Lists active edit sessions (purple "session" badge) above completed jobs (with thumbnail previews)
 - **Iteration timeline**: horizontal strip of clickable thumbnails (one per iteration)
 - **Selected image**: large preview of the clicked iteration
 - **Edit form**: text input for edit instructions + strength slider (0.05–0.95)
+- **End Session button**: closes the session and promotes the result to the gallery
 - **Stats**: iteration count and base prompt
 
 ---
@@ -322,11 +355,11 @@ Frontend (2s interval)                   Backend
     │                                      │
     │  GET /jobs/{job_id}                  │
     │ ────────────────────────────────────► │
-    │ ◄── { status: "running", ... }       │
+    │ ◄── { state: "running", ... }        │
     │                                      │
     │  GET /jobs/{job_id}                  │
     │ ────────────────────────────────────► │
-    │ ◄── { status: "completed", ... }     │
+    │ ◄── { state: "completed", ... }      │
     │                                      │
     │  GET /jobs/{job_id}/image            │
     │ ────────────────────────────────────► │
@@ -336,8 +369,8 @@ Frontend (2s interval)                   Backend
     ▼                                      ▼
 ```
 
-1. **Poll loop** (`Generate.jsx`): Every 2 seconds, calls `GET /jobs/{job_id}` until `status` is `completed` or `failed`
-2. **Image fetch** (`useEffect`): When status becomes `completed`, calls `GET /jobs/{job_id}/image`
+1. **Poll loop** (`Generate.jsx`): Every 2 seconds, calls `GET /jobs/{job_id}` until `state` is `completed` or `failed`
+2. **Image fetch** (`useEffect`): When state becomes `completed`, calls `GET /jobs/{job_id}/image`
 3. **Display:** Response bytes are turned into a `Blob URL` via `URL.createObjectURL()` and rendered in an `<img>` tag
 4. **Cleanup:** Previous Blob URLs are revoked on unmount or when a new image replaces them
 
@@ -422,7 +455,7 @@ Frontend (2s interval)                   Backend
 | `engines/adaptive_sampler.py` | ModelManager, QualityEvaluator, PromptPipeline | Feedback-driven generation loop |
 | `engines/model_manager.py` | diffusers, torch | SD 1.5 pipeline load + generate + img2img |
 | `engines/quality_evaluator.py` | transformers (CLIP), OpenCV, numpy, PIL | Image quality scoring |
-| `engines/iterative_generator.py` | ModelManager | Iterative img2img editing API |
+| `engines/iterative_generator.py` | ModelManager, PromptPipeline (optional) | Iterative img2img editing API |
 | `store/artifact_store.py` | pymongo, PIL | Image + metadata persistence |
 | `db/connection.py` | pymongo, motor | Singleton MongoDB clients |
 | `core/models.py` | stdlib only | `Job`, `AttemptRecord`, `Iteration`, `EditSession`, `JobState` dataclasses |
@@ -471,6 +504,85 @@ Frontend (2s interval)                   Backend
 
 | Service | Image / Build | Port | Notes |
 |---------|--------------|------|-------|
+| `mongo` | `mongo:7` | 27017 | Data stored in `mongo-data` volume; healthcheck via `mongosh` ping |
+| `backend` | Build from `./Dockerfile` | 8000 | NVIDIA GPU passthrough; HF model cache volume; depends on healthy `mongo` |
+| `frontend` | Build from `./frontend/Dockerfile` | 3000 | Nginx serves the built React SPA; proxies `/api` to the backend |
+
+**Volumes:**
+- `mongo-data` — persistent MongoDB storage
+- `hf-cache` — cached Hugging Face model weights (SD 1.5, CLIP, Flan-T5)
+
+---
+
+## 11. Architecture Decisions
+
+### ADR-001: Adaptive Sampling Over Model Fine-Tuning
+
+**Status:** Accepted
+
+**Context:** Two approaches were considered for improving output quality — fine-tuning model weights (e.g. LoRA) vs. adaptive sampling with feedback-driven regeneration.
+
+**Decision:** PixelForge implements adaptive sampling with quality feedback rather than model fine-tuning.
+
+**Rationale:**
+- Distortion is often a sampling instability issue, not a model weights issue
+- Regeneration with parameter adjustment is computationally cheaper than fine-tuning
+- No risk of catastrophic forgetting or overfitting
+- Fully offline and dataset-independent
+- Reversible and controllable — original model weights are never modified
+
+**Trade-offs:**
+- Limited ability to correct deep model biases
+- Relies on heuristic quality scoring (CLIP + sharpness) rather than learned quality models
+
+### ADR-002: Single GPU Worker Architecture
+
+**Status:** Accepted
+
+**Context:** Stable Diffusion is GPU-intensive and concurrent execution risks VRAM fragmentation, race conditions, and unpredictable latency.
+
+**Decision:** Implement a single-worker FIFO job queue with a GPU mutex (`asyncio.Lock`).
+
+**Rationale:**
+- Ensures exclusive GPU access — no VRAM contention
+- Predictable job lifecycle and latency
+- Avoids memory fragmentation from interleaved generation
+- Simplifies debugging and observability
+
+**Trade-offs:**
+- No parallel throughput — jobs are serialised
+- Horizontal scaling requires architectural redesign (see roadmap Phase 3)
+
+---
+
+## 12. Design Principles
+
+1. **Fully offline execution** — No external API calls, no cloud dependencies, no fine-tuning
+2. **No ML imports in core domain layer** — `core/models.py` uses stdlib only; ML dependencies are isolated in `engines/`
+3. **Single GPU exclusive access** — One job at a time via FIFO queue + async mutex
+4. **Deterministic metadata logging** — Every attempt records seed, steps, CFG, score, and timing for reproducibility
+5. **Modular ML execution layer** — ModelManager, QualityEvaluator, and AdaptiveSampler are independent, injectable components
+6. **Configurable adaptive loop** — Quality threshold, max attempts, and scoring weights are all configurable
+7. **Clear separation of concerns** — API layer never touches ML code directly; orchestrator manages lifecycle; engines handle generation
+
+---
+
+## 13. Technology Stack
+
+| Layer | Technology | Purpose |
+|-------|-----------|---------|
+| **Frontend** | React 18, Vite 5, Tailwind CSS 3 | Single-page application |
+| **Routing** | React Router v6 | Client-side navigation, route guards |
+| **API** | FastAPI, Uvicorn | Async REST API, background tasks |
+| **Auth** | bcrypt, PyJWT (HS256) | Password hashing, JWT tokens (24h expiry) |
+| **Validation** | Pydantic v2 | Request/response model validation |
+| **ML — Generation** | Stable Diffusion 1.5 (`diffusers`), PyTorch | Text-to-image and image-to-image generation |
+| **ML — Quality** | CLIP ViT-B/32 (`transformers`), OpenCV | Text-image alignment scoring, sharpness |
+| **ML — Prompts** | SymSpell, Flan-T5-small (`transformers`) | Spelling correction, grammar correction |
+| **Database** | MongoDB 7 (`pymongo`, `motor`) | Users, jobs, artifacts, sessions |
+| **Containerisation** | Docker, Docker Compose | Multi-service deployment with GPU passthrough |
+| **Reverse Proxy** | Nginx | Serve frontend SPA, proxy API requests |
+| **Testing** | pytest, httpx | Backend unit and integration tests |
 | `mongo` | `mongo:7` | 27017 | Persistent volume `mongo-data` |
 | `backend` | Custom `Dockerfile` | 8000 | NVIDIA GPU required, HF cache volume |
 | `frontend` | Custom `frontend/Dockerfile` | 3000 (nginx) | Vite build → nginx static serving, proxies `/api` to backend |

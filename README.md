@@ -10,12 +10,16 @@ PixelForge automatically evaluates generated images and intelligently adjusts sa
 
 ## Features
 
-- **Adaptive regeneration loop** — automatically retries with tuned parameters (steps, CFG, seed, negative prompt) when quality falls below threshold (max 3 attempts)
+- **Adaptive regeneration loop** — automatically retries with tuned parameters (steps, CFG, seed, negative prompt) when quality falls below threshold (up to 10 attempts)
 - **Quality scoring** — combined CLIP text-image alignment + Laplacian sharpness, normalised to 0–1
+- **Prompt preprocessing** — three-stage pipeline: SymSpell spelling correction → Flan-T5 grammar correction → rule-based diffusion-friendly enhancement
+- **Iterative editing sessions** — generate an initial image, then apply successive img2img edits (e.g. "add neon lights", "make it nighttime") with adjustable strength
+- **JWT authentication** — secure user registration, login, and protected endpoints with bcrypt + HS256 JWTs
 - **Fully offline** — no external APIs, no cloud dependencies, no fine-tuning
 - **GPU-optimised** — CUDA float16 inference with attention slicing, VAE slicing, and optional xformers
-- **GPU-only** — requires an NVIDIA GPU with CUDA; no CPU fallback
-- **REST API** — FastAPI backend with async job queue and PNG artifact retrieval
+- **REST API** — FastAPI backend with async job queue, background tasks, and PNG artifact retrieval
+- **React frontend** — single-page application with generation studio, iterative editing UI, job history sidebar, and responsive design
+- **Docker deployment** — three-service Docker Compose setup (backend + frontend + MongoDB) with GPU passthrough
 - **Deterministic metadata** — every attempt logged with seed, steps, CFG, score, and generation time
 
 ---
@@ -24,9 +28,14 @@ PixelForge automatically evaluates generated images and intelligently adjusts sa
 
 ```
 ┌──────────────────────────┐
+│     React Frontend       │
+│     (Vite + Tailwind)    │
+└──────────────┬───────────┘
+               │ HTTP
+               ▼
+┌──────────────────────────┐
 │        FastAPI API        │
-│   POST /generate          │
-│   GET  /jobs, /artifacts  │
+│   (Auth + Jobs + Sessions)│
 └──────────────┬───────────┘
                │
                ▼
@@ -38,7 +47,8 @@ PixelForge automatically evaluates generated images and intelligently adjusts sa
                ▼
 ┌──────────────────────────┐
 │    Generation Engine      │
-│  ├── ModelManager         │
+│  ├── PromptPipeline       │
+│  ├── ModelManager (SD 1.5)│
 │  ├── QualityEvaluator     │
 │  └── AdaptiveSampler      │
 └──────────────┬───────────┘
@@ -50,21 +60,26 @@ PixelForge automatically evaluates generated images and intelligently adjusts sa
 └──────────────────────────┘
 ```
 
-| Layer | Responsibility |
-|---|---|
-| **API** (`api/`) | HTTP endpoints, request validation, background task dispatch |
-| **Orchestrator** (`orchestrator/`) | FIFO job queue, GPU mutual exclusion, lifecycle tracking |
-| **Engines** (`engines/`) | ML execution — model loading, generation, quality evaluation, adaptive loop |
-| **Core** (`core/`) | Domain models (`Job`, `AttemptRecord`, `JobState`) — no ML imports |
-| **Store** (`store/`) | Image and metadata persistence |
+| Layer | Module | Responsibility |
+|---|---|---|
+| **Frontend** | `frontend/` | React SPA — prompt input, generation studio, iterative editing, job history |
+| **API** | `api/` | HTTP endpoints, request validation, background task dispatch, auth |
+| **Auth** | `auth/` | JWT authentication, bcrypt password hashing, user management |
+| **Orchestrator** | `orchestrator/` | FIFO job queue, GPU mutual exclusion, lifecycle tracking |
+| **Engines** | `engines/` | ML execution — prompt preprocessing, model loading, generation, quality evaluation, adaptive loop |
+| **Core** | `core/` | Domain models (`Job`, `AttemptRecord`, `EditSession`, `JobState`) — no ML imports |
+| **Store** | `store/` | Image and metadata persistence (MongoDB + in-memory) |
+| **DB** | `db/` | MongoDB connection management, index creation |
 
 ---
 
 ## Requirements
 
 - Python 3.10+
+- Node.js 18+ (for frontend development)
 - NVIDIA GPU with CUDA 11+ and 8 GB+ VRAM
 - CUDA-capable PyTorch installation
+- MongoDB 7+ (optional — falls back to in-memory stores)
 
 ---
 
@@ -99,73 +114,88 @@ pip install -r requirements.txt
 > **Note:** For CUDA support, ensure you install the appropriate PyTorch build for your CUDA version.
 > See [pytorch.org/get-started](https://pytorch.org/get-started/locally/) for details.
 
-### 3. Run the server
+### 3. Run the backend
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-On first launch the Stable Diffusion 1.5 and CLIP models are downloaded and loaded into GPU memory. Subsequent restarts reuse the cached model files.
+On first launch the Stable Diffusion 1.5, CLIP, and Flan-T5 models are downloaded and loaded into GPU memory. Subsequent restarts reuse the cached model files.
+
+### 4. Run the frontend (development)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+The React app starts on `http://localhost:5173` and proxies API requests to `http://localhost:8000`.
+
+### 5. Docker Compose (production)
+
+```bash
+docker compose up --build
+```
+
+This starts three services:
+- **MongoDB** on port 27017
+- **FastAPI backend** on port 8000 (with NVIDIA GPU passthrough)
+- **Nginx frontend** on port 3000
 
 ---
 
-## API Usage
+## API Endpoints
 
-### Generate an image
+### Authentication
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/auth/register` | Register a new user (username, email, password) | No |
+| POST | `/auth/login` | Login with email + password, returns JWT | No |
+| GET | `/auth/me` | Get current user profile | Yes |
+
+### Image Generation
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/generate` | Submit a generation job (prompt, optional seed, optional negative_prompt) | Yes |
+| GET | `/jobs` | List all submitted jobs | No |
+| GET | `/jobs/{job_id}` | Get status of a specific job | No |
+| GET | `/jobs/{job_id}/image` | Get the best image for a completed job (PNG) | No |
+| GET | `/artifacts/{artifact_id}` | Download a stored image by artifact ID (PNG) | No |
+| GET | `/artifacts/{artifact_id}/meta` | Get attempt metadata for an artifact | No |
+
+### Iterative Editing Sessions
+
+| Method | Endpoint | Description | Auth |
+|--------|----------|-------------|------|
+| POST | `/generate-session` | Create a new editing session (generates initial image) | Yes |
+| POST | `/edit` | Apply an edit to the latest iteration (session_id, edit_instruction, strength) | Yes |
+| GET | `/sessions` | List all active editing sessions | Yes |
+| GET | `/sessions/{session_id}` | Get full session with all iterations | Yes |
+| GET | `/sessions/{session_id}/image/{iteration}` | Get image for a specific iteration (PNG) | No |
+| DELETE | `/sessions/{session_id}` | End session and promote result to gallery | Yes |
+
+### Example Usage
 
 ```bash
+# Register
+curl -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"username": "demo", "email": "demo@example.com", "password": "secret123"}'
+
+# Generate (use the token from register/login response)
 curl -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "A portrait of a woman in soft lighting"}'
-```
+  -H "Authorization: Bearer <token>" \
+  -d '{"prompt": "A dragon flying over a neon city at night"}'
 
-Response:
-
-```json
-{ "job_id": "abc123..." }
-```
-
-### Check job status
-
-```bash
+# Check status
 curl http://localhost:8000/jobs/{job_id}
-```
 
-Response:
-
-```json
-{
-  "job_id": "abc123...",
-  "status": "completed",
-  "attempts": 2,
-  "best_score": 0.78,
-  "error": null
-}
-```
-
-### Retrieve the image (PNG)
-
-```bash
-curl http://localhost:8000/artifacts/{artifact_id} --output image.png
-```
-
-### Retrieve attempt metadata
-
-```bash
-curl http://localhost:8000/artifacts/{artifact_id}/meta
-```
-
-Response:
-
-```json
-{
-  "prompt": "A portrait of a woman in soft lighting",
-  "attempts": [
-    { "attempt": 1, "seed": 42, "steps": 30, "guidance_scale": 7.5, "quality_score": 0.61, "generation_time": 4.2 },
-    { "attempt": 2, "seed": 314, "steps": 40, "guidance_scale": 8.25, "quality_score": 0.78, "generation_time": 5.1 }
-  ],
-  "selected_attempt": 2
-}
+# Download the image
+curl http://localhost:8000/jobs/{job_id}/image --output image.png
 ```
 
 ---
@@ -174,17 +204,16 @@ Response:
 
 Each generation request passes through the adaptive sampler:
 
-1. Generate image with current parameters
-2. Score quality (CLIP alignment + sharpness)
-3. If score >= threshold (default `0.65`) → accept
-4. Otherwise adjust and retry:
-   - **Steps:** +10 per retry (bounded to 100)
-   - **CFG scale:** ×1.1 per retry (bounded to 20.0)
-   - **Seed:** randomised
-   - **Negative prompt:** strengthened with default anti-artifact terms
-5. Repeat up to 3 attempts, then return the best-scoring image
-
-Debug logging prints every attempt with score, parameters, and timing.
+1. **Preprocess** the prompt through the PromptPipeline (spelling → grammar → enhancement)
+2. **Generate** an image with current parameters via Stable Diffusion 1.5
+3. **Score** quality using CLIP text-image alignment (50%) + Laplacian sharpness (50%)
+4. If score >= threshold (default `0.80`) → **accept**
+5. Otherwise **adjust and retry**:
+   - Steps: +10 per retry (bounded to 100)
+   - CFG scale: ×1.1 per retry (bounded to 20.0)
+   - Seed: randomised
+   - Negative prompt: strengthened with anti-artifact terms
+6. Repeat up to **10 attempts**, then return the best-scoring image
 
 ---
 
@@ -192,46 +221,92 @@ Debug logging prints every attempt with score, parameters, and timing.
 
 ```
 PixelForge/
-├── main.py                    # Entry point — model loading + app creation
-├── requirements.txt
+├── main.py                        # Entry point — model loading + app creation
+├── requirements.txt               # Python dependencies
+├── Dockerfile                     # Backend container
+├── docker-compose.yml             # Multi-service deployment
 ├── api/
-│   └── app.py                 # FastAPI routes and app factory
+│   └── app.py                     # FastAPI routes and app factory
+├── auth/
+│   ├── router.py                  # Register / Login / Me endpoints
+│   ├── security.py                # bcrypt + JWT helpers
+│   ├── dependencies.py            # get_current_user dependency
+│   ├── models.py                  # User dataclass
+│   └── store.py                   # MongoDB user store
 ├── core/
-│   └── models.py              # Domain models (Job, AttemptRecord, JobState)
+│   └── models.py                  # Job, AttemptRecord, EditSession, JobState
 ├── engines/
-│   ├── model_manager.py       # Stable Diffusion pipeline (load once, generate)
-│   ├── adaptive_sampler.py    # Feedback-driven regeneration loop
-│   └── quality_evaluator.py   # CLIP + sharpness scoring
+│   ├── model_manager.py           # SD 1.5 pipeline (txt2img + img2img)
+│   ├── quality_evaluator.py       # CLIP alignment + sharpness scoring
+│   ├── adaptive_sampler.py        # Feedback-driven regeneration loop
+│   ├── iterative_generator.py     # Session-based img2img editing
+│   └── prompt_pipeline.py         # SymSpell + Flan-T5 + enhancement
 ├── orchestrator/
-│   └── orchestrator.py        # FIFO job queue with GPU mutex
+│   └── orchestrator.py            # FIFO job queue with GPU mutex
 ├── store/
-│   └── artifact_store.py      # In-memory image + metadata persistence
-└── tests/
-    ├── test_adaptive_sampler.py
-    ├── test_api.py
-    ├── test_artifact_store.py
-    ├── test_core_models.py
-    ├── test_orchestrator.py
-    └── test_quality_evaluator.py
+│   └── artifact_store.py          # InMemory + MongoDB artifact storage
+├── db/
+│   └── connection.py              # MongoDB connection management
+├── frontend/
+│   ├── Dockerfile                 # Frontend container (Nginx)
+│   ├── nginx.conf                 # Reverse proxy config
+│   ├── package.json               # Node.js dependencies
+│   └── src/
+│       ├── api.js                 # API client (fetch wrapper)
+│       ├── App.jsx                # Router + route guards
+│       ├── main.jsx               # React bootstrap
+│       ├── components/
+│       │   └── Navbar.jsx         # Navigation bar
+│       ├── context/
+│       │   ├── AuthContext.jsx    # Auth state provider
+│       │   └── useAuth.js         # Auth hook
+│       └── pages/
+│           ├── Landing.jsx        # Marketing homepage
+│           ├── Login.jsx          # Login form
+│           ├── Register.jsx       # Registration form
+│           └── Generate.jsx       # Image generation + editing studio
+├── tests/
+│   ├── test_core_models.py        # Job state transitions, dataclass tests
+│   ├── test_quality_evaluator.py  # CLIP + sharpness scoring
+│   ├── test_adaptive_sampler.py   # Adaptive loop logic
+│   ├── test_orchestrator.py       # Job queue + GPU mutex
+│   ├── test_artifact_store.py     # Image + metadata persistence
+│   ├── test_api.py                # End-to-end HTTP integration tests
+│   └── _inmemory_user_store.py    # Test-only user store
+├── IMPLEMENTED.md                 # Complete function reference
+├── UNIMPLEMENTED.md               # Stubs, deferred features, roadmap
+└── WORKFLOW.md                    # System workflow & architecture
 ```
 
 ---
 
-## Running Tests
+## Testing
 
-Tests are designed to run **without** ML dependencies — all engine components are mocked.
+### Backend (pytest)
+
+All tests run **without** GPU hardware — engine components are mocked via `PIXELFORGE_SKIP_LOAD=1`.
 
 ```bash
-pip install pytest httpx pytest-asyncio
+# Windows
+set PIXELFORGE_SKIP_LOAD=1
 python -m pytest tests/ -v
+
+# Linux / macOS
+PIXELFORGE_SKIP_LOAD=1 pytest tests/ -v
 ```
 
-To skip model loading during test imports:
+| Test File | Coverage |
+|---|---|
+| `test_core_models.py` | Job lifecycle, AttemptRecord, EditSession serialisation |
+| `test_quality_evaluator.py` | CLIP scoring, sharpness metric, weighted combination |
+| `test_adaptive_sampler.py` | Parameter adjustments, retry loop, best-attempt selection |
+| `test_orchestrator.py` | FIFO ordering, GPU mutex, concurrent jobs |
+| `test_artifact_store.py` | In-memory + MongoDB image and metadata persistence |
+| `test_api.py` | Full HTTP integration — auth, generation, sessions, error responses |
 
-```bash
-set PIXELFORGE_SKIP_LOAD=1      # Windows
-export PIXELFORGE_SKIP_LOAD=1   # Linux / macOS
-```
+### Frontend
+
+Manual testing performed — no automated test suite yet. See [UNIMPLEMENTED.md](UNIMPLEMENTED.md) for planned additions.
 
 ---
 
@@ -239,15 +314,36 @@ export PIXELFORGE_SKIP_LOAD=1   # Linux / macOS
 
 | Variable | Default | Description |
 |---|---|---|
-| `PIXELFORGE_SKIP_LOAD` | `0` | Set to `1` to skip model loading at startup (for testing) |
+| `PIXELFORGE_SKIP_LOAD` | `0` | Skip model loading at startup (for testing) |
+| `PIXELFORGE_JWT_SECRET` | dev-only SHA-256 hash | JWT signing secret (change in production) |
+| `MONGO_URL` | `mongodb://localhost:27017` | MongoDB connection URI |
+| `MONGO_DB_NAME` | `pixelforge` | MongoDB database name |
 
 ---
 
 ## GPU Memory Management
 
-- Attention slicing and VAE slicing are enabled automatically to reduce VRAM usage
-- xformers memory-efficient attention is enabled when available
-- `torch.cuda.empty_cache()` is called after every generation attempt
+- Float16 inference reduces VRAM usage by ~50%
+- Attention slicing and VAE slicing enabled automatically
+- xformers memory-efficient attention enabled when available
+- `torch.cuda.empty_cache()` called after every generation attempt
+- CUDA OOM errors are caught gracefully — the adaptive sampler retries with reduced parameters
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [IMPLEMENTED.md](IMPLEMENTED.md) | Complete function-level reference for every implemented symbol |
+| [UNIMPLEMENTED.md](UNIMPLEMENTED.md) | Stubs, deferred features, and development roadmap |
+| [WORKFLOW.md](WORKFLOW.md) | End-to-end system workflow, architecture decisions, design principles, deployment topology |
+
+---
+
+## License
+
+This project is for educational and research purposes.
 - CUDA OOM errors are caught, cached memory is freed, and the adaptive loop continues with reduced steps
 
 ---

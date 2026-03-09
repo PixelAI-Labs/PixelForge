@@ -21,3 +21,16 @@ artifacts/
 *.jpg
 *.jpeg
 .mypy_cache/
+
+# Documentation files (kept locally, not tracked)
+PROJECT_REPORT.md
+ADR.md
+API.md
+Deployment.md
+DESIGN.md
+DRD
+Evalution.md
+Performance_Analysis.md
+PRD.md
+Rodmap.md
+Test.md

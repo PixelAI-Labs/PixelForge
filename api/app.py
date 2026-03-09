@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -54,7 +54,8 @@ class GenerateResponse(BaseModel):
 
 class JobStatusResponse(BaseModel):
     job_id: str
-    status: str
+    state: str
+    prompt: str = ""
     attempts: int
     best_score: float
     error: Optional[str] = None
@@ -120,9 +121,27 @@ def create_app(
         async def _startup() -> None:
             await ping_mongo()
             await ensure_indexes()
+            # Restore edit sessions from MongoDB
+            try:
+                restored = store.load_sessions()
+                edit_sessions.update(restored)
+                if restored:
+                    logger.info("Restored %d edit sessions from MongoDB.", len(restored))
+            except Exception:
+                logger.warning("Could not restore edit sessions.", exc_info=True)
 
         @app.on_event("shutdown")
         async def _shutdown() -> None:
+            # Promote active sessions to gallery and flush to MongoDB
+            for s in edit_sessions.values():
+                try:
+                    _persist_session_result(s)
+                except Exception:
+                    logger.warning("Failed to promote session %s on shutdown.", s.session_id)
+                try:
+                    store.save_session(s)
+                except Exception:
+                    logger.warning("Failed to flush session %s on shutdown.", s.session_id)
             close_clients()
 
     mm = model_manager or ModelManager(auto_load=False)
@@ -133,10 +152,85 @@ def create_app(
         quality_threshold=quality_threshold,
         prompt_pipeline=pp,
     )
-    itergen = IterativeGenerator(mm)
+    itergen = IterativeGenerator(mm, prompt_pipeline=pp)
 
-    # session_id -> EditSession (in-memory; production should persist)
+    # session_id -> EditSession (persisted to MongoDB automatically)
     edit_sessions: Dict[str, EditSession] = {}
+    _persisted_session_jobs: set[str] = set()  # session_ids already promoted to gallery
+
+    def _persist_session(session: EditSession) -> None:
+        """Save session state to the backing store."""
+        try:
+            store.save_session(session)
+        except Exception:
+            logger.warning("Failed to persist session %s", session.session_id, exc_info=True)
+
+    def _persist_session_result(session: EditSession) -> None:
+        """Promote the final iteration of a session to the gallery as a Job.
+
+        Creates a Job record with the session's final image so it appears
+        in the jobs list / gallery alongside normal generations.
+        Skips if already persisted (deduplication).
+        """
+        if session.session_id in _persisted_session_jobs:
+            logger.info("Session %s already promoted to gallery — skipping.", session.session_id)
+            return
+        latest = session.latest_iteration
+        if latest is None or latest.artifact_id is None:
+            logger.info("Session %s has no completed iteration — skipping gallery promotion.", session.session_id)
+            return
+
+        # Build edit history summary
+        edit_history = [
+            {"iteration": it.iteration, "instruction": it.edit_instruction, "prompt": it.prompt}
+            for it in session.iterations
+            if it.edit_instruction
+        ]
+
+        # Create a Job so the result shows up in GET /jobs
+        job = Job(
+            prompt=latest.prompt,
+            job_id=session.session_id,  # reuse session_id as job_id
+            seed=None,
+        )
+        # Fabricate a single AttemptRecord pointing at the final image
+        attempt = AttemptRecord(
+            attempt_number=0,
+            seed=0,
+            steps=30,
+            guidance_scale=7.0,
+            width=512,
+            height=512,
+            quality_score=0.0,
+            generation_time=0.0,
+            image_key=latest.artifact_id,
+        )
+        job.add_attempt(attempt)
+        job.mark_completed(best_attempt=0)
+        job.created_at = session.created_at
+
+        # Register in the orchestrator so GET /jobs returns it
+        orch.submit(job)
+        # Directly set completed state (already done above via mark_completed)
+        orch._jobs[job.job_id] = job
+        if orch._col is not None:
+            from orchestrator.orchestrator import _job_to_doc
+            orch._col.replace_one({"job_id": job.job_id}, _job_to_doc(job), upsert=True)
+
+        # Save metadata so GET /jobs/{id}/image works
+        store.save_metadata(
+            job.job_id,
+            latest.prompt,
+            [attempt],
+            0,
+        )
+
+        _persisted_session_jobs.add(session.session_id)
+        logger.info(
+            "Session %s promoted to gallery as job %s (prompt=%r, iterations=%d, edits=%d)",
+            session.session_id, job.job_id, latest.prompt,
+            len(session.iterations), len(edit_history),
+        )
 
     # ---- helpers ------------------------------------------------
 
@@ -203,7 +297,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="Job not found")
         return JobStatusResponse(
             job_id=job.job_id,
-            status=job.state.value,
+            state=job.state.value,
+            prompt=job.prompt,
             attempts=len(job.attempts),
             best_score=round(job.best_score(), 4),
             error=job.error,
@@ -264,6 +359,7 @@ def create_app(
                 artifact_id=artifact_id,
             )
             session.add_iteration(it)
+            _persist_session(session)
 
         edit_sessions[session.session_id] = session
         background_tasks.add_task(_run)
@@ -310,9 +406,25 @@ def create_app(
                 artifact_id=artifact_id,
             )
             session.add_iteration(it)
+            _persist_session(session)
 
         background_tasks.add_task(_run)
         return EditResponse(session_id=req.session_id, iteration=next_iter)
+
+    @app.get("/sessions")
+    async def list_sessions(
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> List[Dict[str, Any]]:
+        """Return all active edit sessions (summary only)."""
+        result = []
+        for s in edit_sessions.values():
+            result.append({
+                "session_id": s.session_id,
+                "original_prompt": s.original_prompt,
+                "iteration_count": len(s.iterations),
+                "created_at": s.created_at,
+            })
+        return result
 
     @app.get("/sessions/{session_id}")
     async def get_session(
@@ -339,5 +451,30 @@ def create_app(
                 if data:
                     return Response(content=data, media_type="image/png")
         raise HTTPException(status_code=404, detail="Image not found for this iteration")
+
+    @app.delete("/sessions/{session_id}")
+    async def end_session(
+        session_id: str,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> Dict[str, str]:
+        """End (close) an editing session."""
+        session = edit_sessions.pop(session_id, None)
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        # Promote final iteration to gallery
+        try:
+            _persist_session_result(session)
+        except Exception:
+            logger.warning("Failed to promote session %s to gallery", session_id, exc_info=True)
+        # Persist final state then remove from DB
+        try:
+            store.save_session(session)
+        except Exception:
+            logger.warning("Failed final save for session %s", session_id)
+        try:
+            store.delete_session(session_id)
+        except Exception:
+            logger.warning("Failed to delete session %s from store", session_id)
+        return {"status": "ended", "session_id": session_id}
 
     return app

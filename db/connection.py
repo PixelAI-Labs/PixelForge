@@ -126,6 +126,9 @@ async def ensure_indexes() -> None:
     # Artifact metadata
     await _create_index_safe(db.artifact_meta, "job_id", unique=True)
 
+    # Edit sessions
+    await _create_index_safe(db.edit_sessions, "session_id", unique=True)
+
     logger.info("MongoDB indexes ensured.")
 
 

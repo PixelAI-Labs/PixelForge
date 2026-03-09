@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Protocol
 
 from PIL import Image
 
-from core.models import AttemptRecord
+from core.models import AttemptRecord, EditSession, Iteration
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ class InMemoryArtifactStore:
         self._images: Dict[str, bytes] = {}
         self._meta: Dict[str, Dict[str, Any]] = {}
         self._job_artifacts: Dict[str, List[str]] = {}  # job_id -> [artifact_ids]
+        self._sessions: Dict[str, Dict[str, Any]] = {}
 
     def save_image(self, image: Image.Image, job_id: str, attempt: int) -> str:
         artifact_id = uuid.uuid4().hex
@@ -90,6 +91,38 @@ class InMemoryArtifactStore:
     def get_metadata(self, job_id: str) -> Optional[Dict[str, Any]]:
         return self._meta.get(job_id)
 
+    # ---- edit-session persistence --------------------------------
+
+    def save_session(self, session: EditSession) -> None:
+        self._sessions[session.session_id] = session.to_dict()
+
+    def load_sessions(self) -> Dict[str, EditSession]:
+        result: Dict[str, EditSession] = {}
+        for sid, doc in self._sessions.items():
+            result[sid] = _session_from_dict(doc)
+        return result
+
+    def delete_session(self, session_id: str) -> None:
+        self._sessions.pop(session_id, None)
+
+
+def _session_from_dict(doc: Dict[str, Any]) -> EditSession:
+    """Reconstruct an EditSession from a dict/MongoDB document."""
+    s = EditSession(
+        session_id=doc["session_id"],
+        original_prompt=doc.get("original_prompt", ""),
+        created_at=doc.get("created_at", 0.0),
+    )
+    for it_doc in doc.get("iterations", []):
+        s.add_iteration(Iteration(
+            iteration=it_doc["iteration"],
+            prompt=it_doc.get("prompt", ""),
+            edit_instruction=it_doc.get("edit_instruction", ""),
+            artifact_id=it_doc.get("artifact_id"),
+            created_at=it_doc.get("created_at", 0.0),
+        ))
+    return s
+
 
 # ---- MongoDB implementation ------------------------------------
 
@@ -103,6 +136,7 @@ class MongoArtifactStore:
 
     def __init__(self, db) -> None:
         from pymongo.database import Database as SyncDatabase
+        self._db = db
         self._artifacts = db["artifacts"]
         self._meta = db["artifact_meta"]
 
@@ -171,3 +205,21 @@ class MongoArtifactStore:
     def get_metadata(self, job_id: str) -> Optional[Dict[str, Any]]:
         doc = self._meta.find_one({"job_id": job_id}, {"_id": 0})
         return doc
+
+    # ---- edit-session persistence --------------------------------
+
+    def save_session(self, session: EditSession) -> None:
+        doc = session.to_dict()
+        self._db["edit_sessions"].replace_one(
+            {"session_id": session.session_id}, doc, upsert=True,
+        )
+
+    def load_sessions(self) -> Dict[str, EditSession]:
+        result: Dict[str, EditSession] = {}
+        for doc in self._db["edit_sessions"].find({}, {"_id": 0}):
+            s = _session_from_dict(doc)
+            result[s.session_id] = s
+        return result
+
+    def delete_session(self, session_id: str) -> None:
+        self._db["edit_sessions"].delete_one({"session_id": session_id})

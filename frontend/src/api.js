@@ -122,8 +122,16 @@ export async function editImage(sessionId, editInstruction, strength = 0.35) {
   });
 }
 
+export async function listSessions() {
+  return request('/sessions');
+}
+
 export async function getSession(sessionId) {
   return request(`/sessions/${sessionId}`);
+}
+
+export async function endSession(sessionId) {
+  return request(`/sessions/${sessionId}`, { method: 'DELETE' });
 }
 
 export async function fetchSessionImage(sessionId, iteration) {

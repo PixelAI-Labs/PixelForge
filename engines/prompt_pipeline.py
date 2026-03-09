@@ -203,3 +203,33 @@ class PromptPipeline:
             enhanced = f"{enhanced}{_QUALITY_SUFFIX}"
 
         return enhanced, _DEFAULT_NEGATIVE_PROMPT
+
+    # ---- edit-prompt merging ------------------------------------
+
+    def merge_edit(self, base_prompt: str, edit_instruction: str) -> str:
+        """Merge an edit instruction into a base prompt.
+
+        Appends the edit as a refinement so the base scene description
+        is preserved while the requested change is added.
+
+        Example
+        -------
+        >>> pp = PromptPipeline(enabled=False)
+        >>> pp.merge_edit("a futuristic city street at night", "add neon lights")
+        'a futuristic city street at night, neon lights glowing'
+        """
+        base = base_prompt.rstrip(" ,.")
+        edit = edit_instruction.strip()
+        if not edit:
+            return base_prompt
+
+        # Remove imperative prefixes like "add", "make", "change"
+        lower_edit = edit.lower()
+        for prefix in ("add ", "make it ", "make the ", "change to ", "change the "):
+            if lower_edit.startswith(prefix):
+                edit = edit[len(prefix):]
+                break
+
+        merged = f"{base}, {edit}"
+        logger.info("PromptPipeline | merge_edit: %r + %r → %r", base_prompt, edit_instruction, merged)
+        return merged

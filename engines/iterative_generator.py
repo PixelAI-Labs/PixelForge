@@ -14,6 +14,7 @@ from typing import Optional
 from PIL import Image
 
 from engines.model_manager import ModelManager
+from engines.prompt_pipeline import PromptPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,13 @@ class IterativeGenerator:
     Each call is standalone — session tracking is done by the API layer.
     """
 
-    def __init__(self, model_manager: ModelManager) -> None:
+    def __init__(
+        self,
+        model_manager: ModelManager,
+        prompt_pipeline: Optional[PromptPipeline] = None,
+    ) -> None:
         self._mm = model_manager
+        self._pipeline = prompt_pipeline
 
     # ---- public API ---------------------------------------------
 
@@ -36,6 +42,14 @@ class IterativeGenerator:
         negative_prompt: str = "",
     ) -> Image.Image:
         """Create the first image in an editing session (txt2img)."""
+        if self._pipeline is not None:
+            logger.info("PromptPipeline | original prompt: %r", prompt)
+            prompt, pipeline_neg = self._pipeline.process(prompt)
+            if negative_prompt:
+                negative_prompt = f"{negative_prompt}, {pipeline_neg}"
+            else:
+                negative_prompt = pipeline_neg
+            logger.info("PromptPipeline | final prompt: %r  |  negative: %r", prompt, negative_prompt)
         return self._mm.generate(
             prompt=prompt,
             steps=30,
@@ -72,7 +86,16 @@ class IterativeGenerator:
         negative_prompt : str
             Negative prompt.
         """
-        merged = self.prompt_update(original_prompt, edit_instruction)
+        if self._pipeline is not None:
+            merged = self._pipeline.merge_edit(original_prompt, edit_instruction)
+            merged, pipeline_neg = self._pipeline.process(merged)
+            if negative_prompt:
+                negative_prompt = f"{negative_prompt}, {pipeline_neg}"
+            else:
+                negative_prompt = pipeline_neg
+            logger.info("PromptPipeline | edit merged=%r  negative=%r", merged, negative_prompt)
+        else:
+            merged = self.prompt_update(original_prompt, edit_instruction)
         logger.info(
             "Iterative edit  merged=%r  strength=%.2f", merged, strength,
         )

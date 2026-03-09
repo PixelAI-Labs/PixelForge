@@ -1,6 +1,9 @@
-# Unimplemented Functions
+# PixelForge — Unimplemented Functions & Future Roadmap
 
-This document lists every function or feature in the PixelForge codebase that is **not yet fully implemented** — i.e. stubs, placeholders, or deferred logic.
+This document lists every function or feature in the PixelForge codebase that is **not yet fully implemented** — i.e. stubs, placeholders, or deferred logic — and outlines the planned roadmap for future development.
+
+For all implemented functions, see [IMPLEMENTED.md](IMPLEMENTED.md).  
+For the end-to-end system workflow, see [WORKFLOW.md](WORKFLOW.md).
 
 ---
 
@@ -16,18 +19,21 @@ This document lists every function or feature in the PixelForge codebase that is
 
 Given a completed job object (which contains a `best_attempt` field), this function should resolve and return the artifact key/URL for the best image so it can be rendered inline in the job history sidebar.
 
-### Why it's unimplemented
+### Why it's still a stub
 
 The developer comment reads:
 
 > *"job object from listJobs has best_attempt; we need the artifact key. In a full implementation you'd look this up; for now show via /artifacts endpoint."*
 
-The image display for the **active** job already works via `fetchJobImage()`, but the history list thumbnails do not surface images because this function always returns `null`.
+### Current workaround (functional)
 
-### What needs to happen
+Job history thumbnails now work **without** this function. The `Generate.jsx` component uses `fetchJobImage(jobId)` to lazily fetch each completed job's best image as a blob URL and caches results in the `jobThumbs` state (keyed by `job_id`). A `useEffect` iterates over completed jobs and populates thumbnails via `fetchedThumbsRef` to avoid redundant fetches.
 
-- Call the backend `/artifacts/{job_id}` (or `/artifacts/{job_id}/best`) endpoint to obtain the artifact image URL/blob for a given job.
-- Return that URL so the UI can display a thumbnail in the jobs sidebar.
+The `bestArtifact()` stub still returns `null` but is no longer called in the rendering path — thumbnails are rendered from `jobThumbs[job.job_id]` instead.
+
+### Remaining action
+
+- This function can be safely removed or implemented for completeness, but it is **no longer blocking** thumbnail display.
 
 ---
 
@@ -96,6 +102,45 @@ This is a **Python `Protocol`** (PEP 544). The `...` body is idiomatic and inten
 
 | # | Function / Feature | File | Severity | Action Required |
 |---|--------------------|------|----------|-----------------|
-| 1 | `bestArtifact(job)` | `frontend/src/pages/Generate.jsx:110` | Medium | Implement artifact lookup for job history thumbnails |
+| 1 | `bestArtifact(job)` | `frontend/src/pages/Generate.jsx:110` | Low | Stub still returns `null` but thumbnails work via `fetchJobImage()` + `jobThumbs` state. Can be removed or implemented for completeness. |
 | 2 | Face detection scoring | `engines/quality_evaluator.py:114` | Low | Add MediaPipe-based `face_score()` method and wire it into `evaluate()` |
 | 3 | `ArtifactStoreProtocol` | `store/artifact_store.py:27-31` | None | Idiomatic Protocol stubs — only needed if adding a new storage backend |
+
+---
+
+## Roadmap
+
+### Phase 1 — Core System (Completed)
+- [x] Stable Diffusion 1.5 integration
+- [x] Adaptive regeneration loop (up to 10 attempts)
+- [x] CLIP alignment + Laplacian sharpness quality metrics
+- [x] FastAPI REST API with JWT authentication
+- [x] FIFO job queue with GPU mutex
+- [x] MongoDB artifact persistence
+- [x] React frontend with iterative editing sessions
+- [x] Prompt preprocessing pipeline (SymSpell + Flan-T5 + enhancement)
+- [x] Docker Compose deployment (backend + frontend + MongoDB)
+
+### Phase 2 — Quality Intelligence
+- [ ] Learned distortion classifier (lightweight CNN for artifact detection)
+- [ ] Adaptive CFG prediction (predict optimal CFG from prompt semantics)
+- [ ] Face detection scoring (MediaPipe integration — see item #2 above)
+- [ ] Advanced logging dashboard (real-time job metrics, GPU utilisation)
+
+### Phase 3 — Scaling
+- [ ] Multi-GPU worker pool (replace single mutex with distributed scheduling)
+- [ ] Reinforcement-style sampling policy (trained parameter selection)
+- [ ] Redis / RabbitMQ job queue (persistent, distributed)
+- [ ] S3 / GCS artifact storage (replace MongoDB for images)
+
+### Phase 4 — Personalisation
+- [ ] User preference modelling (learn per-user style preferences from feedback)
+- [ ] Intelligent parameter prediction (predict steps, seed, resolution from prompt)
+- [ ] Prompt history and favourites
+- [ ] Image gallery pagination
+
+### Scalability Improvements (Planned)
+- [ ] Cloud deployment (AWS EC2 GPU / GCP / Azure NC-series with auto-scaling)
+- [ ] Microservice decomposition (API gateway, job scheduler, generation worker, storage)
+- [ ] CDN integration (CloudFront / Cloudflare for image delivery)
+- [ ] Kubernetes orchestration (horizontal pod autoscaling, rolling updates)
