@@ -275,7 +275,7 @@ def create_app(
         background_tasks: BackgroundTasks,
         current_user: Dict[str, Any] = Depends(get_current_user),
     ) -> GenerateResponse:
-        if mm._pipe is None and mm._device is None:
+        if not bool(getattr(mm, "is_loaded", False)):
             raise HTTPException(
                 status_code=503,
                 detail="Image generation is unavailable — no GPU model loaded. "
