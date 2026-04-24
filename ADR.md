@@ -1,83 +1,73 @@
-# ADR-001: Adaptive Sampling Over Model Fine-Tuning
+# PixelForge Architecture Decision Records
 
-## Status
-Accepted
+This document tracks major architecture decisions for PixelForge.
 
-## Context
+## ADR-001: Adaptive Sampling Over Model Fine-Tuning
 
-PixelForge aims to reduce distortion and improve image quality in Stable Diffusion outputs.
+- Status: Accepted
+- Date: 2026-04-24
 
-Two approaches were considered:
+### Context
 
-1. Fine-tuning model weights (e.g., LoRA training)
-2. Adaptive sampling with feedback-driven regeneration
+PixelForge targets higher generation quality without training new model weights.
+Two options were considered:
 
-Fine-tuning introduces:
-- High computational cost
-- Risk of overfitting
-- Irreversible model changes
-- Need for curated training datasets
+1. Fine-tune Stable Diffusion weights (LoRA/full fine-tuning)
+2. Keep model weights fixed and adapt inference parameters per attempt
 
-Adaptive sampling:
-- Adjusts inference parameters
-- Maintains original model weights
-- Is reversible and controllable
-- Requires no additional training data
+### Decision
 
-## Decision
+PixelForge uses a feedback-driven adaptive sampler (steps, CFG, seed, negative prompt adjustments) instead of model fine-tuning.
 
-PixelForge will implement adaptive sampling with quality feedback rather than model fine-tuning.
+### Consequences
 
-## Rationale
+- Positive:
+  - No training dataset or training pipeline required
+  - No catastrophic forgetting risk
+  - Easier rollback and reproducibility
+- Negative:
+  - Improvement depends on quality heuristics
+  - Does not directly fix deep model bias
 
-- Distortion is often a sampling instability issue.
-- Regeneration with parameter adjustment is computationally cheaper.
-- No risk of catastrophic forgetting.
-- Fully offline and dataset-independent.
-- Easier to maintain and debug.
+## ADR-002: Single GPU Worker With FIFO Scheduling
 
-## Consequences
+- Status: Accepted
+- Date: 2026-04-24
 
-Positive:
-- Faster iteration
-- No retraining pipeline required
-- Stable and predictable system behavior
+### Context
 
-Negative:
-- Limited ability to correct deep model biases
-- Relies on heuristic quality scoring
-# ADR-002: Single GPU Worker Architecture
+Concurrent diffusion runs on one GPU increase OOM risk and can cause unpredictable latency.
 
-## Status
-Accepted
+### Decision
 
-## Context
+PixelForge serializes generation with a FIFO orchestrator plus an async GPU lock.
 
-Stable Diffusion is GPU-intensive and can cause:
-- VRAM fragmentation
-- Race conditions
-- Unpredictable latency
+### Consequences
 
-Parallel execution without control risks system instability.
+- Positive:
+  - Stable memory behavior and predictable lifecycle transitions
+  - Simpler debugging and observability
+- Negative:
+  - Throughput is bounded by one active generation at a time
 
-## Decision
+## ADR-003: MongoDB Persistence With Automatic In-Memory Fallback
 
-Implement a single-worker FIFO job queue with a GPU mutex.
+- Status: Accepted
+- Date: 2026-04-24
 
-## Rationale
+### Context
 
-- Ensures exclusive GPU access
-- Predictable job lifecycle
-- Avoids memory fragmentation
-- Simplifies debugging
+The application should run in development/test environments even if MongoDB is unavailable.
 
-## Consequences
+### Decision
 
-Positive:
-- Stability
-- Deterministic behavior
-- Easier observability
+On startup, PixelForge verifies MongoDB connectivity. If unavailable, it automatically switches to in-memory stores.
 
-Negative:
-- Reduced parallel throughput
-- Not horizontally scalable without redesign
+### Consequences
+
+- Positive:
+  - Local development remains unblocked
+  - Test setup is simpler
+- Negative:
+  - In-memory data is not durable across restarts
+  - Behavior differs from production persistence mode

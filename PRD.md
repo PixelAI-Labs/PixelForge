@@ -1,199 +1,91 @@
-# 📄 Product Requirements Document (PRD)
-## Product Name: PixelForge
+# PixelForge Product Requirements Document
 
----
+## 1. Product Summary
 
-## 1. Product Overview
+PixelForge is an offline-first image generation platform built around Stable Diffusion 1.5, with automatic quality evaluation and adaptive regeneration.
 
-PixelForge is a fully offline AI image generation system built on Stable Diffusion 1.5 with adaptive post-processing.
+Primary value:
 
-Unlike traditional diffusion tools that rely on manual parameter tuning, PixelForge automatically evaluates generated images and intelligently adjusts sampling parameters to reduce distortion and improve quality.
-
-The system does not fine-tune model weights.  
-Instead, it improves generation quality through adaptive inference control.
-
----
+- reduce manual prompt-parameter tuning
+- improve quality consistency across generations
+- provide secure authenticated workflows with iterative editing
 
 ## 2. Problem Statement
 
-Diffusion models often produce:
+Raw diffusion output quality can vary heavily by seed and sampling settings. Users often need repeated manual tuning to avoid distortion or low-fidelity outputs.
 
-- Warped faces or limbs
-- Texture artifacts
-- Blurry or muddy outputs
-- Poor prompt alignment
-- Inconsistent results across seeds
-
-Most tools require users to manually:
-
-- Adjust steps
-- Tune CFG scale
-- Change seeds
-- Modify resolution
-- Add negative prompts
-
-This creates friction and technical burden.
-
-There is a need for a system that:
-
-- Automatically evaluates image quality
-- Detects distortion
-- Applies corrective sampling adjustments
-- Produces better results without retraining
-
----
+PixelForge addresses this by automatically evaluating attempts and retrying with bounded parameter changes.
 
 ## 3. Target Users
 
-### Primary Users
-- AI enthusiasts running local models
-- ML students exploring diffusion systems
-- Developers studying adaptive inference
-- Privacy-focused creators
-
-### Secondary Users
-- Researchers exploring generative feedback loops
-- Designers needing iterative improvement
-
----
+- AI creators who run local GPU workflows
+- developers and students learning inference orchestration
+- privacy-focused users who avoid cloud generation tools
 
 ## 4. Product Goals
 
-- Improve output quality automatically
-- Reduce distortion via adaptive regeneration
-- Maintain full offline operation
-- Eliminate manual hyperparameter tuning for basic users
-- Preserve reproducibility and metadata tracking
+- deliver an end-to-end local generation workflow
+- improve accepted image quality through adaptive retries
+- support iterative editing sessions in a single UI
+- persist artifacts and metadata for traceability
 
----
+## 5. In-Scope Features
 
-## 5. User Stories
+### Implemented
 
-1. As a user, I want to generate images without tuning technical parameters.
-2. As a user, I want the system to automatically retry if distortion is detected.
-3. As a user, I want to see quality metrics for each attempt.
-4. As a developer, I want detailed logs of parameter adjustments.
-5. As a researcher, I want to experiment with quality thresholds.
+- JWT auth: register/login/me
+- text-to-image job submission
+- adaptive retry loop with quality scoring
+- job status polling and best-image retrieval
+- iterative edit sessions (create, edit, list, inspect, end)
+- MongoDB persistence with fallback in-memory mode
+- Docker Compose deployment
 
----
+### Out of Scope (Current)
+
+- fine-tuning and LoRA training workflows
+- distributed multi-GPU scheduling
+- face-specific quality metric in production path
+- frontend automated test suite
 
 ## 6. Functional Requirements
 
-### 6.1 Image Generation
-- Accept natural language prompt
-- Generate image using Stable Diffusion 1.5
-- Allow optional seed input
-
-### 6.2 Quality Evaluation
-The system must compute:
-
-- CLIP similarity between prompt and image (true cosine, L2-normalised embeddings)
-- Face detection confidence (when relevant — placeholder, not yet active)
-- Image sharpness via Laplacian variance
-
-All metrics normalized into a 0–1 quality score. Default quality threshold: **0.80**.
-
-### 6.3 Adaptive Regeneration
-
-If quality score < threshold:
-
-- Increase steps (bounded)
-- Adjust CFG scale (bounded)
-- Modify negative prompt
-- Change seed
-- Slightly adjust resolution if needed
-- Regenerate (max 10 attempts)
-
-Select best-scoring image.
-
-### 6.4 Metadata Logging
-
-Store:
-
-- Prompt
-- Seed per attempt
-- Steps per attempt
-- CFG per attempt
-- Resolution
-- Quality score per attempt
-- Final selected image
-- Execution time
-
-### 6.5 Artifact Storage
-
-- Persist images
-- Persist attempt metadata
-- Provide retrieval via API
-
-### 6.6 Authentication
-
-- JWT-based authentication
-- Per-user job tracking
-
----
+1. user can register and authenticate with JWT.
+2. authenticated user can submit generation request with prompt and optional seed/negative prompt.
+3. system can retry generation up to configured max attempts.
+4. system stores attempt metadata and selected result.
+5. user can create and iterate image edit sessions.
+6. user can end sessions and promote final result to gallery/jobs.
 
 ## 7. Non-Functional Requirements
 
-### Performance
-- Initial generation under 15 seconds (GPU)
-- Max 10 regeneration attempts
-- Quality scoring overhead < 200ms (CLIP + sharpness)
+- reliability:
+  - graceful behavior with unavailable MongoDB
+  - consistent job lifecycle transitions
+- performance:
+  - bounded retries
+  - serialized GPU execution for memory safety
+- security:
+  - bcrypt password hashing
+  - JWT bearer auth on protected endpoints
+- maintainability:
+  - modular engine components and clear API boundaries
 
-### Reliability
-- Graceful fallback if ML dependencies unavailable
-- No model reloading during job
+## 8. Success Indicators
 
-### Scalability
-- Single GPU worker
-- FIFO job queue
-- Future-ready for multi-worker extension
+- lower manual re-run burden for common prompts
+- stable generation pipeline under concurrent request load
+- reproducible attempt-level metadata for analysis
 
-### Security
-- Fully offline system
-- No external APIs
+## 9. Risks
 
-### Maintainability
-- Strict separation of domain and ML layers
-- Modular quality evaluation system
+- quality metrics may not fully capture visual defects
+- single-GPU queue limits throughput
+- missing frontend test automation increases regression risk
 
----
+## 10. Next Product Milestones
 
-## 8. Success Metrics
-
-### Quantitative
-- ≥ 25% reduction in distorted outputs
-- ≥ 15% improvement in average CLIP alignment score
-- ≤ 2.5 average attempts per job
-
-### Qualitative
-- Reduced manual intervention
-- Improved subjective image quality
-- Cleaner human faces and textures
-
----
-
-## 9. MVP Scope
-
-### Included
-- Stable Diffusion inference
-- CLIP alignment scoring (true cosine similarity)
-- Iterative image editing via img2img sessions
-- Sharpness detection
-- Adaptive regeneration (max 10 attempts, threshold 0.80)
-- Prompt preprocessing pipeline (SymSpell + Flan-T5 + enhancement)
-- Metadata logging
-- React + Vite frontend with auth
-
-### Excluded
-- Model fine-tuning
-- LoRA blending
-- Reinforcement learning
-- Distributed GPU workers
-
----
-
-## 10. Core Differentiator
-
-PixelForge improves sampling intelligence, not model weights.
-
-Instead of retraining the model, it intelligently explores latent space to find higher-quality outputs.
+- face-quality scoring integration
+- richer artifact metadata APIs
+- distributed queue and worker scaling options
+- frontend automated test coverage

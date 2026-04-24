@@ -1,416 +1,137 @@
-# 📘 PixelForge Design Document
+# PixelForge System Design
 
-## Adaptive Offline Image Generation System
+## 1. Goal
 
----
+PixelForge is an offline image generation system that improves output quality by adapting inference parameters at runtime instead of modifying model weights.
 
-# 1. System Vision
+Core principle:
 
-PixelForge is a fully offline AI image generation system built on Stable Diffusion 1.5.
+- Improve sampling behavior, not model weights.
 
-The system improves output quality using a feedback-driven adaptive inference loop instead of fine-tuning or weight modification.
+## 2. Architecture
 
-Core philosophy:
-
-> Improve sampling intelligence, not model weights.
-
-The system treats diffusion as a stochastic search process and uses measurable quality signals to guide exploration of latent space.
-
----
-
-# 2. System Architecture Overview
-
-```
-┌──────────────────────────┐
-│        Frontend          │
-│     (React + Vite)       │
-└──────────────┬───────────┘
-               │ HTTP
-               ▼
-┌──────────────────────────┐
-│        FastAPI API       │
-│   (Authentication + Jobs)│
-└──────────────┬───────────┘
-               │
-               ▼
-┌──────────────────────────┐
-│     Job Orchestrator     │
-│   (FIFO + GPU Mutex)     │
-└──────────────┬───────────┘
-               │
-               ▼
-┌──────────────────────────┐
-│     Generation Engine    │
-│                          │
-│  ├── ModelManager        │
-│  ├── QualityEvaluator    │
-│  └── AdaptiveSampler     │
-└──────────────┬───────────┘
-               │
-               ▼
-┌──────────────────────────┐
-│      Artifact Store      │
-│ (MongoDB / In-Memory)    │
-└──────────────────────────┘
+```text
+React Frontend
+   |
+   v
+FastAPI API (auth + jobs + sessions)
+   |
+   v
+Orchestrator (FIFO queue + async GPU lock)
+   |
+   v
+Generation Layer
+  - PromptPipeline
+  - ModelManager
+  - QualityEvaluator
+  - AdaptiveSampler
+   |
+   v
+Artifact/User Stores (MongoDB or in-memory fallback)
 ```
 
----
+## 3. Layer Responsibilities
 
-# 3. Architectural Principles
+### Frontend (frontend/src)
 
-* Fully offline execution
-* No ML imports in core domain layer
-* Single GPU exclusive access
-* Deterministic metadata logging
-* Modular ML execution layer
-* Configurable adaptive loop
-* Clear separation of concerns
+- Authentication UI and route guards
+- Prompt submission
+- Job polling and image rendering
+- Iterative session editing UX
 
----
+### API Layer (api/app.py)
 
-# 4. Component Design
+- Endpoint validation and serialization
+- Authentication enforcement on protected routes
+- Background job dispatch
+- Session lifecycle endpoints
 
----
+### Orchestration Layer (orchestrator/orchestrator.py)
 
-## 4.1 Frontend Layer (React + Vite)
+- FIFO scheduling
+- Job lifecycle transitions
+- Single active GPU execution lock
+- Optional persistence to MongoDB jobs collection
 
-### Responsibilities:
+### Generation Layer (engines)
 
-* Prompt input interface
-* Display generation progress
-* Show attempt history and quality scores
-* Display final selected image
-* Authentication UI
-* Gallery browsing
+- ModelManager: SD 1.5 txt2img/img2img pipelines and CUDA memory protections
+- PromptPipeline: spelling, grammar, and quality prompt enrichment
+- QualityEvaluator: CLIP alignment plus sharpness scoring
+- AdaptiveSampler: retry loop with bounded parameter adjustments
 
-### Design Notes:
+### Persistence Layer (store, db, auth/store)
 
-* Stateless UI
-* Communicates only through REST API
-* No direct ML logic
+- User, artifact, metadata, and session persistence in MongoDB
+- In-memory fallback mode for unavailable DB/test contexts
 
----
+## 4. Adaptive Sampling Design
 
-## 4.2 API Layer (FastAPI)
+Each generation request can run up to 10 attempts.
 
-### Responsibilities:
+Retry adjustments:
 
-* Accept generation requests
-* Manage authentication (JWT)
-* Expose job status endpoints
-* Serve artifacts
-* Serve quality metadata
+- steps: +10 (max 100)
+- guidance scale: x1.1 (max 20.0)
+- seed: regenerated
+- negative prompt: strengthened
 
-### Endpoints:
+Threshold behavior:
 
-* POST `/generate`
-* GET `/jobs`
-* GET `/jobs/{id}`
-* GET `/artifacts/{id}`
-* GET `/artifacts/{id}/meta`
+- App factory default threshold is 0.65
+- AdaptiveSampler class default is 0.80
+- create_app currently passes 0.65 unless overridden
 
-### Design Constraints:
+The best-scoring attempt is stored and exposed to clients.
 
-* Non-blocking request handling
-* Return job ID immediately
-* Poll-based job status
+## 5. Quality Evaluation Design
 
----
+Implemented scoring components:
 
-## 4.3 Job Orchestrator
+- CLIP text-image cosine alignment, remapped to [0, 1]
+- Laplacian sharpness score, normalized to [0, 1]
 
-### Purpose:
+Deferred component:
 
-Manage safe and controlled GPU execution.
+- face scoring placeholder remains weight 0.0
 
-### Responsibilities:
+Combined score:
 
-* FIFO queue
-* Single GPU lock (mutex)
-* Job lifecycle tracking:
-
-  * Pending
-  * Running
-  * Completed
-  * Failed
-  * Cancelled
-* Cooperative cancellation support
-
-### Design Rationale:
-
-Diffusion models are GPU-intensive and not safe for concurrent execution without control.
-
----
-
-## 4.4 Generation Engine
-
-This is the core intelligence layer.
-
-It consists of three subcomponents.
-
----
-
-### 4.4.1 ModelManager
-
-#### Responsibilities:
-
-* Load Stable Diffusion 1.5 once at startup
-* Manage device placement
-* Expose configurable generation interface
-
-#### Design Constraints:
-
-* Use `dtype=torch.float16`
-* Load model once
-* No reloading during jobs
-* Parameterized inference call
-
-#### Interface Example:
-
-```
-generate(prompt, steps, guidance_scale, seed, width, height)
+```text
+score = (w_clip * clip + w_face * face + w_sharpness * sharpness) / total_weight
 ```
 
----
+## 6. Session Editing Design
 
-### 4.4.2 QualityEvaluator
+Iterative sessions keep a timeline of edits:
 
-#### Purpose:
+1. create session with initial txt2img output
+2. apply edit instructions through img2img
+3. persist each iteration artifact
+4. end session to promote final image to jobs/gallery
 
-Quantitatively measure image quality.
+## 7. Runtime and Reliability Decisions
 
-#### Metrics:
+- GPU-only generation path for production use
+- OOM handling with cache clearing and retry logic
+- MongoDB connectivity check at startup
+- automatic in-memory fallback when MongoDB is unreachable
 
-1. CLIP Alignment
+## 8. Security Design
 
-   * Extract image & text embeddings via CLIP ViT-B/32
-   * L2-normalise both vectors
-   * True cosine similarity, remapped [-1, 1] → [0, 1]
-   * Graceful fallback to sharpness-only if CLIP unavailable
+- bcrypt password hashing
+- JWT access token (HS256)
+- protected generation/session endpoints via dependency injection
 
-2. Face Detection Score
+## 9. Known Trade-Offs
 
-   * Detect face presence
-   * Confidence scoring
-   * *(Placeholder — not yet active, weight = 0)*
+- Single-worker GPU lock favors stability over throughput
+- No frontend automated test suite yet
+- Session/image APIs are partially public by design (job/session image fetch endpoints)
 
-4. Sharpness Score
+## 10. Extension Points
 
-   * Laplacian variance (OpenCV)
-
-#### Combined Score:
-
-```
-quality_score =
-    w1 * alignment +
-    w2 * face_score +
-    w3 * sharpness
-```
-
-Normalized between 0 and 1.
-
-#### Design Goals:
-
-* Lightweight (<200ms overhead)
-* Deterministic
-* Extensible
-
----
-
-### 4.4.3 AdaptiveSampler
-
-#### Purpose:
-
-Adjust inference parameters based on feedback.
-
-#### Algorithm:
-
-1. Generate initial image
-2. Evaluate quality
-3. If score ≥ threshold → accept
-4. Else:
-
-   * Increase steps (bounded)
-   * Adjust CFG slightly
-   * Change seed
-   * Strengthen negative prompt
-5. Regenerate
-6. Repeat up to max 10 attempts
-7. Select best-scoring image
-
-#### Constraints:
-
-* Max 10 attempts
-* Quality threshold: 0.80
-* Small parameter deltas (steps +10, CFG ×1.1)
-* Keep best attempt
-* CUDA OOM handling: clear cache, reduce steps, continue
-
-#### Rationale:
-
-Sampling variability is stochastic. Many distortions can be corrected via re-sampling without modifying model weights.
-
----
-
-## 4.5 Artifact Store
-
-### Responsibilities:
-
-* Persist images
-* Persist attempt metadata
-* Track quality scores
-* Provide retrieval
-
-### Storage Options:
-
-* MongoDB (primary)
-* In-memory fallback
-
-### Metadata Stored:
-
-* Prompt
-* Seed per attempt
-* Steps per attempt
-* CFG per attempt
-* Quality score per attempt
-* Selected attempt
-* Execution time
-
----
-
-# 5. Data Flow
-
-1. User submits prompt.
-2. API creates job.
-3. Job enters FIFO queue.
-4. Orchestrator acquires GPU lock.
-5. Initial image generated.
-6. Quality evaluated.
-7. Adaptive loop executed if needed.
-8. Best result stored.
-9. Job marked completed.
-10. Frontend retrieves result.
-
----
-
-# 6. Technology Stack
-
----
-
-## 6.1 Machine Learning
-
-| Technology     | Purpose                           | Justification                    |
-| -------------- | --------------------------------- | -------------------------------- |
-| PyTorch        | Core tensor engine                | Industry standard, GPU optimized |
-| Diffusers      | Stable Diffusion implementation   | Modular, maintained              |
-| Transformers   | CLIP + Flan-T5                    | Alignment scoring, grammar correction |
-| OpenCV         | Sharpness detection               | Efficient image processing       |
-| SymSpellPy     | Spelling correction               | Fast compound word correction    |
-| Mediapipe      | Face detection (planned)          | Lightweight and reliable         |
-
----
-
-## 6.2 Backend
-
-| Technology | Purpose          | Justification                 |
-| ---------- | ---------------- | ----------------------------- |
-| FastAPI    | REST API         | Async, high performance       |
-| Uvicorn    | ASGI server      | Lightweight production server |
-| PyJWT      | Authentication   | Stateless JWT handling        |
-| bcrypt     | Password hashing | Secure hashing                |
-
----
-
-## 6.3 Frontend
-
-| Technology   | Purpose          | Justification      |
-| ------------ | ---------------- | ------------------ |
-| React        | UI framework     | Declarative UI     |
-| Vite         | Build tool       | Fast HMR, modern bundling |
-| Tailwind CSS | Styling          | Rapid development  |
-
----
-
-## 6.4 Persistence
-
-| Technology      | Purpose          | Justification                |
-| --------------- | ---------------- | ---------------------------- |
-| MongoDB         | Artifact storage | Flexible document storage    |
-| In-memory store | Fallback         | Resilience if DB unavailable |
-
----
-
-# 7. Performance Design
-
-* GPU-only generation recommended
-* Max 10 regeneration attempts (threshold 0.80)
-* No model reload inside loop
-* CLIP + sharpness scoring under 200ms
-* Img2img editing uses shared pipeline weights (no extra VRAM)
-* Single-worker execution
-
----
-
-# 8. Observability
-
-Each generation attempt logs:
-
-* Seed
-* Steps
-* CFG
-* Resolution
-* Quality score
-* Generation time
-* Total attempts
-
-Structured logging recommended.
-
----
-
-# 9. Scalability Considerations
-
-Future extensibility:
-
-* Multi-GPU worker pool
-* Distributed job queue
-* Persistent job recovery
-* Learned quality predictor
-* Reinforcement-style sampling policy
-
----
-
-# 10. Design Philosophy
-
-PixelForge does not modify model weights.
-
-It improves the exploration strategy of latent space.
-
-Instead of treating diffusion as a one-shot generator,
-it treats it as a controllable stochastic search process.
-
-This preserves model stability while improving output reliability.
-
-```
-
----
-
-Now step back and notice something important.
-
-Your project has evolved from:
-
-“Local Stable Diffusion app”
-
-into
-
-“Closed-loop generative control system.”
-
-That is a much stronger conceptual foundation.
-
-The interesting future question is not “can it generate?”
-
-It’s:
-
-Which signals best predict distortion, and how should sampling policy respond?
-
-That’s where engineering becomes research.
-```
+- Add face scoring model
+- Add persistent/distributed queue backend
+- Add multi-GPU orchestration
+- Add object storage backend for artifacts

@@ -1,75 +1,72 @@
-# 📊 Evaluation Strategy
+# PixelForge Evaluation Strategy
 
-## Purpose
+This document defines how image quality is evaluated in PixelForge and how that score drives adaptive retries.
 
-Define measurable criteria to determine image quality improvement.
+## 1. Evaluation Objective
 
----
+Measure whether generated images are both:
 
-## Metrics
+- semantically aligned with prompt intent
+- visually coherent and sharp enough for acceptance
 
-### 1. CLIP Alignment Score
+## 2. Implemented Metrics
 
-Measures semantic similarity between:
-- Prompt text
-- Generated image
+### CLIP Alignment Score
 
-Implementation:
-- Encode prompt using CLIP text encoder
-- Encode image using CLIP image encoder
-- Compute cosine similarity
+- Model: openai/clip-vit-base-patch32
+- Method: cosine similarity between normalized text and image embeddings
+- Output normalization: remap from [-1, 1] to [0, 1]
 
-Range: 0–1
+### Sharpness Score
 
----
+- Method: OpenCV Laplacian variance on grayscale image
+- Output normalization: capped into [0, 1]
 
-### 2. Face Detection Confidence
+### Face Score (Deferred)
 
-Used when prompt implies human presence.
+- Current runtime value: 0.0 with default face weight 0.0
+- Planned: add real face quality/confidence metric
 
-Implementation:
-- Mediapipe face detection
-- Confidence thresholding
+## 3. Combined Score
 
-Score scaled 0–1.
+```text
+quality = (w_clip * clip + w_face * face + w_sharpness * sharpness) / total_weight
+```
 
----
+Current defaults in QualityEvaluator:
 
-### 3. Sharpness Score
+- w_clip = 0.5
+- w_face = 0.0
+- w_sharpness = 0.5
 
-Detects blur and texture degradation.
+## 4. Threshold Policy
 
-Implementation:
-- OpenCV Laplacian variance
-- Normalized to 0–1
+- App-level adaptive threshold default: 0.65
+- Sampler-level class default: 0.80
+- Effective threshold is what create_app passes to AdaptiveSampler (currently 0.65).
 
----
+If score < threshold, retry logic adjusts parameters and regenerates.
 
-## Combined Quality Score
+## 5. Evaluation Artifacts
 
-quality_score =
-    w1 * alignment +
-    w2 * face_score +
-    w3 * sharpness
+For each attempt, metadata stores:
 
-Weights configurable.
+- seed
+- steps
+- guidance scale
+- width/height
+- quality score
+- generation time
+- artifact key
 
----
+## 6. Limitations
 
-## Threshold Policy
+- CLIP can reward semantic alignment even when anatomy is imperfect.
+- Sharpness cannot evaluate composition quality.
+- Face-specific quality signal is not implemented yet.
 
-If quality_score < threshold:
-- Trigger adaptive regeneration
+## 7. Planned Enhancements
 
-Default threshold: 0.65
-
----
-
-## Limitations
-
-- CLIP may misjudge creative styles.
-- Sharpness does not measure composition.
-- Face detection irrelevant for landscapes.
-
-Future improvement:
-- Learned distortion classifier.
+- Add optional face metric when w_face > 0.
+- Add distortion classifier to better detect structural artifacts.
+- Add offline benchmark prompt suites for regression scoring.
