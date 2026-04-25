@@ -117,7 +117,9 @@ async def ensure_indexes() -> None:
 
     # Jobs
     await _create_index_safe(db.jobs, "job_id", unique=True)
+    await _create_index_safe(db.jobs, "user_id")
     await _create_index_safe(db.jobs, "created_at")
+    await _create_index_safe(db.jobs, [("user_id", 1), ("created_at", -1)])
 
     # Artifacts (images)
     await _create_index_safe(db.artifacts, "artifact_id", unique=True)
@@ -128,6 +130,7 @@ async def ensure_indexes() -> None:
 
     # Edit sessions
     await _create_index_safe(db.edit_sessions, "session_id", unique=True)
+    await _create_index_safe(db.edit_sessions, "user_id")
 
     logger.info("MongoDB indexes ensured.")
 

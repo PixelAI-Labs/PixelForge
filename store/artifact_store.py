@@ -26,6 +26,7 @@ class ArtifactStoreProtocol(Protocol):
 
     def save_image(self, image: Image.Image, job_id: str, attempt: int) -> str: ...
     def get_image_bytes(self, artifact_id: str) -> Optional[bytes]: ...
+    def get_artifact_job_id(self, artifact_id: str) -> Optional[str]: ...
     def get_best_image_bytes(self, job_id: str) -> Optional[bytes]: ...
     def save_metadata(self, job_id: str, prompt: str, attempts: List[AttemptRecord], selected: int) -> None: ...
     def get_metadata(self, job_id: str) -> Optional[Dict[str, Any]]: ...
@@ -52,6 +53,12 @@ class InMemoryArtifactStore:
 
     def get_image_bytes(self, artifact_id: str) -> Optional[bytes]:
         return self._images.get(artifact_id)
+
+    def get_artifact_job_id(self, artifact_id: str) -> Optional[str]:
+        for job_id, artifact_ids in self._job_artifacts.items():
+            if artifact_id in artifact_ids:
+                return job_id
+        return None
 
     def get_best_image_bytes(self, job_id: str) -> Optional[bytes]:
         """Return the best (selected) image for a job, or the last one."""
@@ -111,6 +118,7 @@ def _session_from_dict(doc: Dict[str, Any]) -> EditSession:
     s = EditSession(
         session_id=doc["session_id"],
         original_prompt=doc.get("original_prompt", ""),
+        user_id=doc.get("user_id", ""),
         created_at=doc.get("created_at", 0.0),
     )
     for it_doc in doc.get("iterations", []):
@@ -158,6 +166,15 @@ class MongoArtifactStore:
         if doc is None:
             return None
         return bytes(doc["data"])
+
+    def get_artifact_job_id(self, artifact_id: str) -> Optional[str]:
+        doc = self._artifacts.find_one(
+            {"artifact_id": artifact_id},
+            {"job_id": 1, "_id": 0},
+        )
+        if doc is None:
+            return None
+        return doc.get("job_id")
 
     def get_best_image_bytes(self, job_id: str) -> Optional[bytes]:
         """Return the best (selected) image for a job."""

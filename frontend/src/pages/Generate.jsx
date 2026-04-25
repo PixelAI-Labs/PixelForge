@@ -5,6 +5,21 @@ import {
 } from '../api';
 
 const POLL_MS = 2000;
+const EDIT_STRENGTH = 1.0;
+
+function CreationLoadingOverlay({ message }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-dark-900/85 backdrop-blur-sm flex items-center justify-center px-6">
+      <div className="glass rounded-2xl p-8 w-full max-w-md text-center border-brand-500/30 shadow-2xl shadow-brand-900/30">
+        <div className="mx-auto mb-5 h-14 w-14 rounded-full border-4 border-brand-500/20 border-t-brand-400 animate-spin" />
+        <h3 className="text-xl font-semibold mb-2">
+          <span className="gradient-text">Working On Your Image</span>
+        </h3>
+        <p className="text-dark-100 text-sm">{message}</p>
+      </div>
+    </div>
+  );
+}
 
 function StatusBadge({ status }) {
   const map = {
@@ -43,7 +58,6 @@ export default function Generate() {
   const [sessionId, setSessionId] = useState(null);
   const [session, setSession] = useState(null);
   const [editInstruction, setEditInstruction] = useState('');
-  const [editStrength, setEditStrength] = useState(0.35);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editError, setEditError] = useState('');
   const [iterationImages, setIterationImages] = useState({});  // { iteration: blobUrl }
@@ -51,6 +65,30 @@ export default function Generate() {
   const sessionPollRef = useRef(null);
   const fetchedItersRef = useRef(new Set());
   const prevIterCountRef = useRef(0);
+  const [isEditProcessing, setIsEditProcessing] = useState(false);
+  const pendingEditIterationRef = useRef(null);
+  const editProcessingTimeoutRef = useRef(null);
+
+  function clearEditProcessingState() {
+    pendingEditIterationRef.current = null;
+    if (editProcessingTimeoutRef.current) {
+      clearTimeout(editProcessingTimeoutRef.current);
+      editProcessingTimeoutRef.current = null;
+    }
+    setIsEditProcessing(false);
+  }
+
+  const isJobGenerating = Boolean(activeJob && ['pending', 'running'].includes(activeJob.state));
+  const isSessionInitializing = Boolean(sessionId && (!session || session.iterations.length === 0));
+  const showCreationLoader = submitting || isJobGenerating || isSessionInitializing || isEditProcessing;
+
+  const creationMessage = isEditProcessing
+    ? 'Applying your edit and rendering the next iteration...'
+    : isSessionInitializing
+      ? 'Creating the initial session image...'
+      : isJobGenerating
+        ? 'Generating your image. This may take up to a minute...'
+        : 'Submitting your generation request...';
 
   // Fetch image when active job is completed
   useEffect(() => {
@@ -132,6 +170,7 @@ export default function Generate() {
   useEffect(() => {
     if (!sessionId) {
       fetchedItersRef.current = new Set();
+      clearEditProcessingState();
       return;
     }
     const poll = async () => {
@@ -156,10 +195,15 @@ export default function Generate() {
                   if (prev[it.iteration]) URL.revokeObjectURL(prev[it.iteration]);
                   return { ...prev, [it.iteration]: url };
                 });
-                setSelectedIteration(it.iteration);
+                if (pendingEditIterationRef.current === it.iteration) {
+                  clearEditProcessingState();
+                }
               })
               .catch(() => {
                 fetchedItersRef.current.delete(it.iteration);
+                if (pendingEditIterationRef.current === it.iteration) {
+                  clearEditProcessingState();
+                }
               });
           }
         }
@@ -174,6 +218,9 @@ export default function Generate() {
   useEffect(() => {
     return () => {
       Object.values(iterationImages).forEach((url) => URL.revokeObjectURL(url));
+      if (editProcessingTimeoutRef.current) {
+        clearTimeout(editProcessingTimeoutRef.current);
+      }
     };
   }, []);
 
@@ -182,12 +229,23 @@ export default function Generate() {
     if (!editInstruction.trim() || !sessionId) return;
     setEditError('');
     setEditSubmitting(true);
+    const nextIteration = session?.iterations?.length ?? 0;
+    clearEditProcessingState();
+    pendingEditIterationRef.current = nextIteration;
+    setIsEditProcessing(true);
+    editProcessingTimeoutRef.current = setTimeout(() => {
+      if (pendingEditIterationRef.current === nextIteration) {
+        clearEditProcessingState();
+        setEditError('Edit is taking longer than expected. Please try again.');
+      }
+    }, 90000);
     try {
-      await editImage(sessionId, editInstruction.trim(), editStrength);
+      await editImage(sessionId, editInstruction.trim(), EDIT_STRENGTH);
       setEditInstruction('');
       // Session poll will pick up the new iteration
     } catch (err) {
       setEditError(err.message);
+      clearEditProcessingState();
     } finally {
       setEditSubmitting(false);
     }
@@ -198,29 +256,28 @@ export default function Generate() {
     try {
       await endSession(sessionId);
     } catch { /* ignore — session may already be gone */ }
-    clearInterval(sessionPollRef.current);
-    fetchedItersRef.current = new Set();
-    prevIterCountRef.current = 0;
-    setSessionId(null);
-    setSession(null);
-    setSelectedIteration(null);
-    Object.values(iterationImages).forEach((url) => URL.revokeObjectURL(url));
-    setIterationImages({});
+    clearSessionView();
     setEditInstruction('');
     setEditError('');
     refreshSessions();
     refreshJobs();  // session promoted to gallery on end
   }
 
-  async function handleResumeSession(sid) {
-    // Clear any existing session state
+  function clearSessionView() {
     clearInterval(sessionPollRef.current);
     fetchedItersRef.current = new Set();
     prevIterCountRef.current = 0;
+    clearEditProcessingState();
+    setSessionId(null);
+    setSession(null);
+    setSelectedIteration(null);
     Object.values(iterationImages).forEach((url) => URL.revokeObjectURL(url));
     setIterationImages({});
-    setSelectedIteration(null);
-    setSession(null);
+  }
+
+  async function handleResumeSession(sid) {
+    // Clear any existing session/job state before resuming a session
+    clearSessionView();
     setActiveJob(null);
     // Load the session
     setSessionId(sid);
@@ -231,11 +288,13 @@ export default function Generate() {
     if (!prompt.trim()) return;
     setError('');
     setSubmitting(true);
+    setActiveJob(null);
     setSession(null);
     setIterationImages({});
     setSelectedIteration(null);
     fetchedItersRef.current = new Set();
     prevIterCountRef.current = 0;
+    clearEditProcessingState();
     try {
       const { session_id } = await createEditSession(
         prompt.trim(),
@@ -256,6 +315,7 @@ export default function Generate() {
     if (!prompt.trim()) return;
     setError('');
     setSubmitting(true);
+    clearSessionView();
     try {
       const { job_id } = await generateImage(
         prompt.trim(),
@@ -280,7 +340,11 @@ export default function Generate() {
   }
 
   return (
-    <div className="min-h-screen pt-24 pb-12 px-4 sm:px-6">
+    <>
+      {showCreationLoader && (
+        <CreationLoadingOverlay message={creationMessage} />
+      )}
+      <div className="min-h-screen pt-24 pb-12 px-4 sm:px-6">
       <div className="max-w-6xl mx-auto">
         <h1 className="text-3xl font-bold mb-2">
           <span className="gradient-text">Image Studio</span>
@@ -403,7 +467,10 @@ export default function Generate() {
                   {jobs.map((j) => (
                     <button
                       key={j.job_id}
-                      onClick={() => setActiveJob(j)}
+                      onClick={() => {
+                        clearSessionView();
+                        setActiveJob(j);
+                      }}
                       className={`w-full text-left px-3 py-2.5 rounded-xl border transition-colors text-sm ${
                         activeJob?.job_id === j.job_id
                           ? 'border-brand-500/50 bg-brand-600/10'
@@ -446,7 +513,7 @@ export default function Generate() {
           {/* Right: Display */}
           <div className="lg:col-span-3 space-y-6">
             {/* Edit Session Panel */}
-            {session && session.iterations.length > 0 && (
+            {sessionId && session && session.iterations.length > 0 && (
               <div className="glass rounded-2xl p-6 space-y-4 animate-fade-in-up">
               <div className="flex items-center justify-between">
                 <h2 className="font-semibold text-lg">
@@ -542,20 +609,6 @@ export default function Generate() {
                   </button>
                 </form>
 
-                {/* Strength slider */}
-                <div className="flex items-center gap-3 text-sm">
-                  <label className="text-dark-200 whitespace-nowrap">Strength: {editStrength.toFixed(2)}</label>
-                  <input
-                    type="range"
-                    min="0.05"
-                    max="0.95"
-                    step="0.05"
-                    value={editStrength}
-                    onChange={(e) => setEditStrength(parseFloat(e.target.value))}
-                    className="flex-1"
-                  />
-                </div>
-
                 {editError && (
                   <div className="px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-sm">
                     {editError}
@@ -576,7 +629,7 @@ export default function Generate() {
               </div>
             )}
 
-            {activeJob ? (
+            {!sessionId && (activeJob ? (
               <div className="glass rounded-2xl p-6 space-y-4 animate-fade-in-up">
                 <div className="flex items-center justify-between">
                   <h2 className="font-semibold text-lg truncate pr-4">
@@ -656,10 +709,11 @@ export default function Generate() {
                 <p className="text-lg font-medium mb-1">No image yet</p>
                 <p className="text-sm text-dark-300">Enter a prompt and hit Generate to get started</p>
               </div>
-            )}
+            ))}
           </div>
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }

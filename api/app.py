@@ -192,6 +192,7 @@ def create_app(
             prompt=latest.prompt,
             job_id=session.session_id,  # reuse session_id as job_id
             seed=None,
+            user_id=session.user_id,
         )
         # Fabricate a single AttemptRecord pointing at the final image
         attempt = AttemptRecord(
@@ -231,6 +232,23 @@ def create_app(
             session.session_id, job.job_id, latest.prompt,
             len(session.iterations), len(edit_history),
         )
+
+    def _current_user_id(current_user: Dict[str, Any]) -> str:
+        user_id = str(current_user.get("sub", "")).strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid authentication payload")
+        return user_id
+
+    def _user_owns_job(user_id: str, job_id: str) -> bool:
+        job = orch.get_job(job_id)
+        return job is not None and job.user_id == user_id
+
+    def _user_owns_session(user_id: str, session_id: str) -> bool:
+        session = edit_sessions.get(session_id)
+        return session is not None and session.user_id == user_id
+
+    def _user_owns_resource(user_id: str, resource_id: str) -> bool:
+        return _user_owns_job(user_id, resource_id) or _user_owns_session(user_id, resource_id)
 
     # ---- helpers ------------------------------------------------
 
@@ -281,19 +299,31 @@ def create_app(
                 detail="Image generation is unavailable — no GPU model loaded. "
                        "Set PIXELFORGE_SKIP_LOAD=0 on a CUDA-capable host.",
             )
-        job = Job(prompt=req.prompt, seed=req.seed, negative_prompt=req.negative_prompt)
+        job = Job(
+            prompt=req.prompt,
+            seed=req.seed,
+            negative_prompt=req.negative_prompt,
+            user_id=_current_user_id(current_user),
+        )
         orch.submit(job)
         background_tasks.add_task(orch.run_job, job, _execute_job)
         return GenerateResponse(job_id=job.job_id)
 
     @app.get("/jobs")
-    async def list_jobs() -> list[Dict[str, Any]]:
-        return [j.to_dict() for j in orch.list_jobs()]
+    async def list_jobs(
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> list[Dict[str, Any]]:
+        user_id = _current_user_id(current_user)
+        return [j.to_dict() for j in orch.list_jobs() if j.user_id == user_id]
 
     @app.get("/jobs/{job_id}", response_model=JobStatusResponse)
-    async def get_job(job_id: str) -> JobStatusResponse:
+    async def get_job(
+        job_id: str,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> JobStatusResponse:
+        user_id = _current_user_id(current_user)
         job = orch.get_job(job_id)
-        if job is None:
+        if job is None or job.user_id != user_id:
             raise HTTPException(status_code=404, detail="Job not found")
         return JobStatusResponse(
             job_id=job.job_id,
@@ -305,15 +335,28 @@ def create_app(
         )
 
     @app.get("/artifacts/{artifact_id}")
-    async def get_artifact(artifact_id: str) -> Response:
+    async def get_artifact(
+        artifact_id: str,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> Response:
+        user_id = _current_user_id(current_user)
+        resource_id = store.get_artifact_job_id(artifact_id)
+        if resource_id is None or not _user_owns_resource(user_id, resource_id):
+            raise HTTPException(status_code=404, detail="Artifact not found")
         data = store.get_image_bytes(artifact_id)
         if data is None:
             raise HTTPException(status_code=404, detail="Artifact not found")
         return Response(content=data, media_type="image/png")
 
     @app.get("/jobs/{job_id}/image")
-    async def get_job_image(job_id: str) -> Response:
+    async def get_job_image(
+        job_id: str,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> Response:
         """Return the best generated image for a completed job."""
+        user_id = _current_user_id(current_user)
+        if not _user_owns_job(user_id, job_id):
+            raise HTTPException(status_code=404, detail="Job not found")
         logger.info("Image request for job_id=%s", job_id)
         data = store.get_best_image_bytes(job_id)
         if data is None:
@@ -323,7 +366,13 @@ def create_app(
         return Response(content=data, media_type="image/png")
 
     @app.get("/artifacts/{artifact_id}/meta")
-    async def get_artifact_meta(artifact_id: str) -> Dict[str, Any]:
+    async def get_artifact_meta(
+        artifact_id: str,
+        current_user: Dict[str, Any] = Depends(get_current_user),
+    ) -> Dict[str, Any]:
+        user_id = _current_user_id(current_user)
+        if not _user_owns_resource(user_id, artifact_id):
+            raise HTTPException(status_code=404, detail="Metadata not found")
         # artifact_id is used as job_id in metadata lookup
         # Try finding metadata that references this artifact
         # For simplicity, expose job-level metadata via job_id
@@ -344,7 +393,10 @@ def create_app(
         if mm._pipe is None and mm._device is None:
             raise HTTPException(status_code=503, detail="Model unavailable.")
 
-        session = EditSession(original_prompt=req.prompt)
+        session = EditSession(
+            original_prompt=req.prompt,
+            user_id=_current_user_id(current_user),
+        )
 
         def _run() -> None:
             image = itergen.generate_initial(
@@ -372,8 +424,9 @@ def create_app(
         current_user: Dict[str, Any] = Depends(get_current_user),
     ) -> EditResponse:
         """Apply an edit to the latest image in a session."""
+        user_id = _current_user_id(current_user)
         session = edit_sessions.get(req.session_id)
-        if session is None:
+        if session is None or session.user_id != user_id:
             raise HTTPException(status_code=404, detail="Session not found")
         latest = session.latest_iteration
         if latest is None or latest.artifact_id is None:
@@ -416,8 +469,11 @@ def create_app(
         current_user: Dict[str, Any] = Depends(get_current_user),
     ) -> List[Dict[str, Any]]:
         """Return all active edit sessions (summary only)."""
+        user_id = _current_user_id(current_user)
         result = []
         for s in edit_sessions.values():
+            if s.user_id != user_id:
+                continue
             result.append({
                 "session_id": s.session_id,
                 "original_prompt": s.original_prompt,
@@ -431,8 +487,9 @@ def create_app(
         session_id: str,
         current_user: Dict[str, Any] = Depends(get_current_user),
     ) -> Dict[str, Any]:
+        user_id = _current_user_id(current_user)
         session = edit_sessions.get(session_id)
-        if session is None:
+        if session is None or session.user_id != user_id:
             raise HTTPException(status_code=404, detail="Session not found")
         return session.to_dict()
 
@@ -440,10 +497,12 @@ def create_app(
     async def get_session_image(
         session_id: str,
         iteration: int,
+        current_user: Dict[str, Any] = Depends(get_current_user),
     ) -> Response:
         """Return the image for a specific iteration."""
+        user_id = _current_user_id(current_user)
         session = edit_sessions.get(session_id)
-        if session is None:
+        if session is None or session.user_id != user_id:
             raise HTTPException(status_code=404, detail="Session not found")
         for it in session.iterations:
             if it.iteration == iteration and it.artifact_id:
@@ -458,9 +517,11 @@ def create_app(
         current_user: Dict[str, Any] = Depends(get_current_user),
     ) -> Dict[str, str]:
         """End (close) an editing session."""
-        session = edit_sessions.pop(session_id, None)
-        if session is None:
+        user_id = _current_user_id(current_user)
+        session = edit_sessions.get(session_id)
+        if session is None or session.user_id != user_id:
             raise HTTPException(status_code=404, detail="Session not found")
+        edit_sessions.pop(session_id, None)
         # Promote final iteration to gallery
         try:
             _persist_session_result(session)

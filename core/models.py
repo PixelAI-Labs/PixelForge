@@ -61,6 +61,7 @@ class EditSession:
 
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     original_prompt: str = ""
+    user_id: str = ""
     iterations: List[Iteration] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
 
@@ -75,6 +76,7 @@ class EditSession:
         return {
             "session_id": self.session_id,
             "original_prompt": self.original_prompt,
+            "user_id": self.user_id,
             "iterations": [it.to_dict() for it in self.iterations],
             "created_at": self.created_at,
         }
@@ -97,6 +99,7 @@ class Job:
     error: Optional[str] = None
     negative_prompt: str = ""
     seed: Optional[int] = None
+    user_id: str = ""
 
     # ---- state-transition helpers --------------------------------
 
@@ -131,6 +134,7 @@ class Job:
         return {
             "job_id": self.job_id,
             "prompt": self.prompt,
+            "user_id": self.user_id,
             "state": self.state.value,
             "attempts": len(self.attempts),
             "best_score": round(self.best_score(), 4),

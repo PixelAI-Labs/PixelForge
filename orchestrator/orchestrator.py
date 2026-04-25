@@ -25,6 +25,7 @@ def _job_to_doc(job: Job) -> dict:
     """Serialise a Job dataclass to a MongoDB document."""
     return {
         "job_id": job.job_id,
+        "user_id": job.user_id,
         "prompt": job.prompt,
         "negative_prompt": job.negative_prompt,
         "seed": job.seed,
@@ -58,6 +59,7 @@ def _doc_to_job(doc: dict) -> Job:
         state=JobState(doc["state"]),
         negative_prompt=doc.get("negative_prompt", ""),
         seed=doc.get("seed"),
+        user_id=doc.get("user_id", ""),
         best_attempt=doc.get("best_attempt"),
         created_at=doc["created_at"],
         completed_at=doc.get("completed_at"),

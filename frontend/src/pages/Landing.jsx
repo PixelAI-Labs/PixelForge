@@ -1,5 +1,33 @@
+import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../context/useAuth';
+import desertObservatory from '../assets/landing/desert-observatory.webp';
+import floatingIslands from '../assets/landing/floating-islands.webp';
+import neonGreenhouse from '../assets/landing/neon-greenhouse.webp';
+import oceanLibrary from '../assets/landing/ocean-library.webp';
+
+const galleryImages = [
+  {
+    src: floatingIslands,
+    title: 'Floating Islands',
+    prompt: 'Luminous fantasy landscape',
+  },
+  {
+    src: neonGreenhouse,
+    title: 'Neon Greenhouse',
+    prompt: 'Cyberpunk rooftop garden',
+  },
+  {
+    src: oceanLibrary,
+    title: 'Ocean Library',
+    prompt: 'Moonlit surreal interior',
+  },
+  {
+    src: desertObservatory,
+    title: 'Desert Observatory',
+    prompt: 'Cinematic sci-fi nightscape',
+  },
+];
 
 const features = [
   {
@@ -27,6 +55,23 @@ const features = [
 
 export default function Landing() {
   const { user } = useAuth();
+  const [activeImage, setActiveImage] = useState(0);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setActiveImage((current) => (current + 1) % galleryImages.length);
+    }, 4500);
+
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const showPrevious = () => {
+    setActiveImage((current) => (current - 1 + galleryImages.length) % galleryImages.length);
+  };
+
+  const showNext = () => {
+    setActiveImage((current) => (current + 1) % galleryImages.length);
+  };
 
   return (
     <div className="relative overflow-hidden">
@@ -66,15 +111,77 @@ export default function Landing() {
           </div>
         </div>
 
-        {/* Hero image placeholder */}
-        <div className="mt-16 w-full max-w-3xl aspect-video rounded-2xl glass border border-dark-400/20 flex items-center justify-center animate-fade-in-up" style={{ animationDelay: '0.3s' }}>
-          <div className="flex flex-col items-center gap-3 text-dark-200">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <circle cx="8.5" cy="8.5" r="1.5" />
-              <path d="m21 15-5-5L5 21" />
-            </svg>
-            <span className="text-sm">Your generated masterpiece appears here</span>
+        {/* Generated gallery carousel */}
+        <div className="mt-16 w-full max-w-5xl animate-fade-in-up" style={{ animationDelay: '0.3s' }}>
+          <div className="relative overflow-hidden rounded-2xl glass border border-dark-400/20 shadow-2xl shadow-brand-900/20">
+            <div className="relative aspect-[16/9] bg-dark-800">
+              {galleryImages.map((image, index) => (
+                <img
+                  key={image.title}
+                  src={image.src}
+                  alt={`${image.title} generated with PixelForge`}
+                  className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-700 ${
+                    index === activeImage ? 'opacity-100' : 'opacity-0'
+                  }`}
+                />
+              ))}
+
+              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-dark-900/90 via-dark-900/30 to-transparent p-4 sm:p-6">
+                <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+                  <div className="text-left">
+                    <p className="text-xs font-semibold uppercase tracking-wide text-brand-200">
+                      Generated showcase
+                    </p>
+                    <h2 className="mt-1 text-2xl font-bold text-white sm:text-3xl">
+                      {galleryImages[activeImage].title}
+                    </h2>
+                    <p className="mt-1 text-sm text-dark-50">
+                      {galleryImages[activeImage].prompt}
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={showPrevious}
+                      className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-dark-900/60 text-white transition hover:bg-white/15 active:scale-95"
+                      aria-label="Show previous generated image"
+                      title="Previous image"
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="m15 18-6-6 6-6" />
+                      </svg>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={showNext}
+                      className="flex h-10 w-10 items-center justify-center rounded-full border border-white/20 bg-dark-900/60 text-white transition hover:bg-white/15 active:scale-95"
+                      aria-label="Show next generated image"
+                      title="Next image"
+                    >
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                        <path d="m9 18 6-6-6-6" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-center gap-2 border-t border-dark-400/20 bg-dark-800/70 px-4 py-4">
+              {galleryImages.map((image, index) => (
+                <button
+                  key={image.title}
+                  type="button"
+                  onClick={() => setActiveImage(index)}
+                  className={`h-2.5 rounded-full transition-all ${
+                    index === activeImage ? 'w-8 bg-brand-300' : 'w-2.5 bg-dark-300 hover:bg-dark-100'
+                  }`}
+                  aria-label={`Show ${image.title}`}
+                  title={image.title}
+                />
+              ))}
+            </div>
           </div>
         </div>
       </section>
